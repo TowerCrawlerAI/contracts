@@ -1,0 +1,313 @@
+openapi: 3.1.0
+info:
+  title: Tapestry Control Plane — Party / Membership
+  version: "1.0.0"
+  summary: Parties and membership — the roster a dungeon instance is private to.
+  description: >
+    The party service is the durable home of a party and its membership roster. A party is the unit a
+    dungeon floor is instanced for: the hub (Tavern) floor is shared by everyone, but a dungeon
+    instance is private to one party, so "may this account enter this party's dungeon" reduces to "is
+    this account a member of the party". This contract exposes party CRUD, the caller's own roster of
+    parties, leader-driven membership management, leadership transfer, and a service-scoped membership
+    check used to authorize routing.
+
+
+    Identity always comes from the verified bearer token, never a request body — there is no
+    caller-supplied leader/member uid on create. Per-operation authorization is documented on each
+    operation below: reads are member-only, mutations are leader-only, and the membership check is
+    admin/service-scoped.
+servers:
+  - url: http://localhost:8000
+    description: Control-plane service.
+security:
+  - bearerAuth: []
+tags:
+  - name: parties
+  - name: members
+
+paths:
+  /v1/parties:
+    post:
+      tags: [parties]
+      operationId: createParty
+      summary: Create a party.
+      description: >
+        Creates a party. The authenticated caller becomes the party leader and its first member; the
+        leader/member identity is taken from the verified token, never from the body.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PartyCreate" }
+            example: { name: "The Bone Diggers" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PartyRecord" }
+              example:
+                id: "party-7"
+                name: "The Bone Diggers"
+                leader_uid: "uid-abc123"
+                member_uids: ["uid-abc123"]
+                created_at: "2026-06-30T12:00:00Z"
+                updated_at: "2026-06-30T12:00:00Z"
+        "401":
+          description: Unauthenticated.
+
+  /v1/parties/{party_id}:
+    get:
+      tags: [parties]
+      operationId: getParty
+      summary: Read a party's full record.
+      description: >
+        Returns the party record. Member-only: the caller must be a member of the party (an
+        admin/service principal may also read). A non-member gets `403`; an unknown party gets `404`.
+      parameters: [ { $ref: "#/components/parameters/partyId" } ]
+      responses:
+        "200":
+          description: Party.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PartyRecord" }
+              example:
+                id: "party-7"
+                name: "The Bone Diggers"
+                leader_uid: "uid-abc123"
+                member_uids: ["uid-abc123", "uid-def456"]
+                created_at: "2026-06-30T12:00:00Z"
+                updated_at: "2026-06-30T12:05:00Z"
+        "401": { description: Unauthenticated. }
+        "403": { description: Caller is not a member of this party. }
+        "404": { description: Not found. }
+
+  /v1/accounts/me/parties:
+    get:
+      tags: [parties]
+      operationId: listMyParties
+      summary: List the parties the caller is a member of.
+      description: Returns every party the authenticated caller is currently a member of.
+      responses:
+        "200":
+          description: Parties.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/PartyRecord" }
+              example:
+                - id: "party-7"
+                  name: "The Bone Diggers"
+                  leader_uid: "uid-abc123"
+                  member_uids: ["uid-abc123", "uid-def456"]
+                  created_at: "2026-06-30T12:00:00Z"
+                  updated_at: "2026-06-30T12:05:00Z"
+        "401": { description: Unauthenticated. }
+
+  /v1/parties/{party_id}/members:
+    post:
+      tags: [members]
+      operationId: addMember
+      summary: Add a member to a party.
+      description: >
+        Adds an account to the party roster. Leader-only: only the party leader may add members (an
+        admin/service principal may also add). Any other caller gets `403`; an unknown party gets `404`.
+      parameters: [ { $ref: "#/components/parameters/partyId" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AddMemberRequest" }
+            example: { uid: "uid-def456" }
+      responses:
+        "201":
+          description: Member added; the updated party record is returned.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PartyRecord" }
+              example:
+                id: "party-7"
+                name: "The Bone Diggers"
+                leader_uid: "uid-abc123"
+                member_uids: ["uid-abc123", "uid-def456"]
+                created_at: "2026-06-30T12:00:00Z"
+                updated_at: "2026-06-30T12:05:00Z"
+        "401": { description: Unauthenticated. }
+        "403": { description: Only the leader may add members. }
+        "404": { description: Not found. }
+
+  /v1/parties/{party_id}/members/{uid}:
+    delete:
+      tags: [members]
+      operationId: removeMember
+      summary: Leave a party or remove a member.
+      description: >
+        Removes a member from the party. A member may remove themselves (leave); the leader may remove
+        any other member (an admin/service principal may remove anyone). A caller who is neither the
+        target, the leader, nor an admin gets `403`.
+
+
+        If the leader leaves, leadership transfers to the next remaining member in join order. If the
+        last member leaves, the party is disbanded and the response body is `null`. An unknown party,
+        or a uid that is not a member, gets `404`.
+      parameters:
+        - { $ref: "#/components/parameters/partyId" }
+        - { $ref: "#/components/parameters/memberUid" }
+      responses:
+        "200":
+          description: >
+            Member removed. Returns the updated party record, or `null` if removing the last member
+            disbanded the party.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - { $ref: "#/components/schemas/PartyRecord" }
+                  - { type: "null" }
+              examples:
+                updated:
+                  summary: Member removed, party survives.
+                  value:
+                    id: "party-7"
+                    name: "The Bone Diggers"
+                    leader_uid: "uid-abc123"
+                    member_uids: ["uid-abc123"]
+                    created_at: "2026-06-30T12:00:00Z"
+                    updated_at: "2026-06-30T12:10:00Z"
+                disbanded:
+                  summary: Last member left; party disbanded.
+                  value: null
+        "401": { description: Unauthenticated. }
+        "403": { description: Caller may not remove this member. }
+        "404": { description: "Party not found, or uid is not a member." }
+
+  /v1/parties/{party_id}/leader:
+    post:
+      tags: [parties]
+      operationId: transferLeader
+      summary: Transfer party leadership.
+      description: >
+        Transfers leadership to another member. Leader-only: only the current leader may transfer
+        leadership (an admin/service principal may also transfer). Any other caller gets `403`. The
+        target must already be a member of the party; if it is not, the request is rejected with `400`.
+        An unknown party gets `404`.
+      parameters: [ { $ref: "#/components/parameters/partyId" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TransferLeaderRequest" }
+            example: { new_leader_uid: "uid-def456" }
+      responses:
+        "200":
+          description: Leadership transferred; the updated party record is returned.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PartyRecord" }
+              example:
+                id: "party-7"
+                name: "The Bone Diggers"
+                leader_uid: "uid-def456"
+                member_uids: ["uid-abc123", "uid-def456"]
+                created_at: "2026-06-30T12:00:00Z"
+                updated_at: "2026-06-30T12:15:00Z"
+        "400": { description: Target is not a member of the party. }
+        "401": { description: Unauthenticated. }
+        "403": { description: Only the leader may transfer leadership. }
+        "404": { description: Not found. }
+
+  /v1/parties/{party_id}/members/{uid}/check:
+    get:
+      tags: [members]
+      operationId: checkMembership
+      summary: Check whether an account is a member of a party. (admin/service-scoped)
+      description: >
+        Service-to-service membership check used to authorize routing. **Admin/service-scoped:** the
+        caller must present an admin/service credential; a normal player token is rejected with `403`.
+        Returns `{is_member}`. An unknown party simply yields `false` rather than revealing its
+        existence through a `404`.
+      parameters:
+        - { $ref: "#/components/parameters/partyId" }
+        - { $ref: "#/components/parameters/memberUid" }
+      responses:
+        "200":
+          description: Membership result.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MembershipCheck" }
+              example: { is_member: true }
+        "401": { description: Unauthenticated. }
+        "403": { description: Caller is not an admin/service principal. }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Bearer token — a verified identity token (Firebase) whose subject is the account uid. Identity
+        is taken from the verified token, never from a request body. The admin/service-scoped membership
+        check additionally requires the principal to be an admin/service identity.
+
+  parameters:
+    partyId:
+      name: party_id
+      in: path
+      required: true
+      schema: { type: string }
+    memberUid:
+      name: uid
+      in: path
+      required: true
+      schema: { type: string }
+      description: Account uid.
+
+  schemas:
+    PartyCreate:
+      type: object
+      description: >
+        Request body for creating a party. The caller becomes leader and first member; there is no
+        caller-supplied leader/member uid — identity comes from the verified token.
+      properties:
+        name:
+          type: [string, "null"]
+          minLength: 1
+          description: Optional human-readable party name.
+
+    AddMemberRequest:
+      type: object
+      properties:
+        uid: { type: string, minLength: 1, description: Account uid to add to the party. }
+      required: [uid]
+
+    TransferLeaderRequest:
+      type: object
+      properties:
+        new_leader_uid:
+          type: string
+          minLength: 1
+          description: Member uid to promote to leader; must already be a member.
+      required: [new_leader_uid]
+
+    PartyRecord:
+      type: object
+      description: Full party record returned by the party endpoints.
+      properties:
+        id: { type: string, description: Stable party identifier. }
+        name: { type: [string, "null"], description: Optional human-readable party name. }
+        leader_uid: { type: string, description: Account uid of the current leader. }
+        member_uids:
+          type: array
+          items: { type: string }
+          description: Account uids of all current members, in join order; includes the leader.
+        created_at: { type: [string, "null"], format: date-time }
+        updated_at: { type: [string, "null"], format: date-time }
+      required: [id, leader_uid, member_uids]
+
+    MembershipCheck:
+      type: object
+      properties:
+        is_member: { type: boolean, description: Whether the account is a member of the party. }
+      required: [is_member]
