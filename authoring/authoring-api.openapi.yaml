@@ -1,0 +1,889 @@
+openapi: 3.1.0
+info:
+  title: Tapestry Authoring API (C4)
+  version: "1.0.0"
+  summary: Transactional CRUD over an authoring graph that lowers to a runtime artifact.
+  description: >
+    Contract C4 — the authoring object-model API. It is the single surface both an admin editor and an
+    MCP server target to author content: entities (nodes), typed directed relations (edges), schemaless
+    property bags on both, versioned trigger bodies, room geometry, and the lowering step that compiles
+    the authored graph to a runtime artifact the engine loads.
+
+
+    **Model.** Authoring is a CRUD API over a labeled-property graph. A **world** is the top container
+    (a floor, a hub, a catalog); all resources are scoped under `/v1/worlds/{world}`.
+
+
+    **Identity.** Authors address entities by a stable string `alias`. The runtime integer `id` is
+    minted at lowering and is read-only — present (non-null) only after a world has been lowered.
+
+
+    **Versioning.** Every mutable resource carries a monotonic integer `rev`. Writes may pass an
+    optional `if_rev` for optimistic concurrency; a mismatch returns `409` with code `rev_conflict`.
+
+
+    **Idempotency.** Unsafe POSTs accept an `Idempotency-Key` header so a client (e.g. a replayed MCP
+    tool call) can retry safely.
+
+
+    **Runtime handoff.** Lowering produces a runtime artifact; from then on play and live state ride
+    Contract C1 (command/event protocol) and Contract C2 (portable state), not this API.
+
+servers:
+  - url: http://localhost:8000
+    description: Authoring service.
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: worlds
+  - name: entities
+  - name: properties
+  - name: relations
+  - name: geometry
+  - name: triggers
+  - name: lowering
+
+paths:
+  /v1/worlds/{world}:
+    put:
+      tags: [worlds]
+      operationId: ensureWorld
+      summary: Create (or no-op) the top authoring container.
+      parameters:
+        - $ref: "#/components/parameters/world"
+      responses:
+        "200":
+          description: World exists.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorldRecord" }
+              example: { world: "bone-garden" }
+
+  /v1/worlds/{world}/entities:
+    post:
+      tags: [entities]
+      operationId: createEntity
+      summary: Create an entity with kind/prototype inheritance.
+      description: >
+        An entity is a node with an optional prototype (delegation chain) and a property bag. `kind` is
+        sugar for `parent`: both name a prototype entity this one delegates to. `kind` resolution is
+        explicit `parent` > `kind` > default > root.
+      parameters:
+        - $ref: "#/components/parameters/world"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EntityCreate" }
+            example:
+              alias: crypt
+              name: The Bone Crypt
+              kind: room
+              parent: null
+              prose: "A low basilica of bone, lit by oil-lamps in a chandelier-skull."
+              properties: { light_level: 2 }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EntityRecord" }
+              example:
+                alias: crypt
+                id: null
+                rev: 1
+                kind: room
+                parent: room
+                name: The Bone Crypt
+                prose: "A low basilica of bone, lit by oil-lamps in a chandelier-skull."
+                properties: { light_level: 2 }
+                lifecycle: active
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Error" }
+
+  /v1/worlds/{world}/entities/{alias}:
+    get:
+      tags: [entities]
+      operationId: getEntity
+      summary: Read an entity.
+      description: >
+        With `effective=true`, properties are folded over the prototype chain (the entity's own bag
+        layered on its ancestry). With `effective=false` (default), only the entity's own bag is
+        returned.
+      parameters:
+        - $ref: "#/components/parameters/world"
+        - $ref: "#/components/parameters/alias"
+        - name: effective
+          in: query
+          schema: { type: boolean, default: false }
+          description: Fold properties over the prototype chain.
+      responses:
+        "200":
+          description: Entity.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EntityRecord" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [entities]
+      operationId: patchEntity
+      summary: Partial update of name/kind/parent/prose.
+      parameters:
+        - $ref: "#/components/parameters/world"
+        - $ref: "#/components/parameters/alias"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EntityPatch" }
+            example: { name: "The Bone Crypt (revised)", prose: "Updated prose." }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EntityRecord" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+    delete:
+      tags: [entities]
+      operationId: deleteEntity
+      summary: Deactivate an entity (soft delete).
+      description: >
+        Never a hard delete. Sets `lifecycle: inactive` and severs location edges; the alias stays
+        referenceable.
+      parameters:
+        - $ref: "#/components/parameters/world"
+        - $ref: "#/components/parameters/alias"
+      responses:
+        "204": { description: Deactivated. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/worlds/{world}/entities/{alias}/properties:
+    patch:
+      tags: [properties]
+      operationId: setProperties
+      summary: Deep-merge set + remove keys on a property bag.
+      description: >
+        Property values are variant: scalar, identifier, prose, code, link, list, or a dice-expression
+        string (e.g. "2d6+4"). Merge semantics: `set` deep-merges into the existing bag — nested objects
+        merge key-by-key, lists are atomic (replace, not concat), later wins. `remove` deletes keys.
+      parameters:
+        - $ref: "#/components/parameters/world"
+        - $ref: "#/components/parameters/alias"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PropertyPatch" }
+            example:
+              set: { ac: 13, hp: 22, damage: "1d6+2", type: "undead" }
+              remove: [ draft_note ]
+      responses:
+        "200":
+          description: Updated bag.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PropertyResult" }
+              example: { alias: crypt, rev: 4, properties: { ac: 13, hp: 22, damage: "1d6+2", type: undead } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v1/worlds/{world}/relation-types:
+    post:
+      tags: [relations]
+      operationId: defineRelationType
+      summary: Declare a content relation type (DDL).
+      description: >
+        Declares a typed edge with its directionality, cardinality, role, symmetry, exclusion group,
+        invariants, and an optional payload schema. Built-in relation types (the location group
+        in/on/carried/worn, plus map/support/part-of/sensory/has-seen) ship with the engine; content
+        declares more here.
+      parameters:
+        - $ref: "#/components/parameters/world"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RelationTypeCreate" }
+            example:
+              name: riding
+              directionality: directed
+              cardinality: various-to-one
+              role: containment
+              symmetry: asymmetric
+              exclusion_group: null
+              invariants: [ acyclic ]
+              payload_schema: { cell: "int3?" }
+      responses:
+        "201":
+          description: Declared.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RelationTypeRecord" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v1/worlds/{world}/relations:
+    post:
+      tags: [relations]
+      operationId: createRelation
+      summary: Create or upsert a typed directed edge (DML).
+      description: >
+        Creates an edge. Structural invariants are enforced at write: a second edge in a
+        various-to-one group is a `409 cardinality_violation`; the location group (in/on/carried/worn)
+        is mutually exclusive (setting one auto-evicts the others, so creating a location edge that
+        already exists replaces it rather than adding a second); containment/support/part-of cycles are
+        rejected with `409 acyclicity_violation`.
+      parameters:
+        - $ref: "#/components/parameters/world"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RelationCreate" }
+            example: { type: in, from: altar, to: crypt, payload: { cell: [4, 0, 0] } }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RelationRecord" }
+              example:
+                id: rel_8f3
+                rev: 1
+                type: in
+                from: altar
+                to: crypt
+                role: containment
+                cardinality: various-to-one
+                exclusion_group: location
+                payload: { cell: [4, 0, 0] }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v1/worlds/{world}/relations/{rel_id}:
+    delete:
+      tags: [relations]
+      operationId: deleteRelation
+      summary: Delete an edge.
+      parameters:
+        - $ref: "#/components/parameters/world"
+        - name: rel_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: Deleted. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/worlds/{world}/entities/{alias}/relations:
+    get:
+      tags: [relations]
+      operationId: listRelations
+      summary: Enumerate incident edges of an entity.
+      parameters:
+        - $ref: "#/components/parameters/world"
+        - $ref: "#/components/parameters/alias"
+        - name: dir
+          in: query
+          schema: { type: string, enum: [in, out] }
+          description: Filter to incoming or outgoing edges.
+        - name: type
+          in: query
+          schema: { type: string }
+          description: Filter to a relation type.
+      responses:
+        "200":
+          description: Incident edges.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/RelationRecord" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/worlds/{world}/imports:
+    post:
+      tags: [worlds]
+      operationId: importCatalog
+      summary: Import a versioned catalog so its templates resolve as kind/parent.
+      description: >
+        A catalog is another world of prototype entities (a shared standard library, a bestiary).
+        Importing one makes its templates resolvable as `parent`/`kind`. The import is versioned.
+      parameters:
+        - $ref: "#/components/parameters/world"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ImportCreate" }
+            example: { catalog: stdlib, ref: "0.2.0" }
+      responses:
+        "201":
+          description: Imported.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImportRecord" }
+              example: { catalog: stdlib, ref: "0.2.0" }
+
+  /v1/worlds/{world}/spawn:
+    post:
+      tags: [entities]
+      operationId: spawnFromTemplate
+      summary: Instantiate N entities from a template (count-prefix instantiation).
+      description: >
+        Each instance is a fresh node whose `parent` points at the template, inheriting via the
+        delegation chain. Optionally places each instance into a container and applies per-instance
+        overrides.
+      parameters:
+        - $ref: "#/components/parameters/world"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SpawnRequest" }
+            example:
+              template: skeleton
+              count: 6
+              into: crypt
+              alias_prefix: skeleton
+              overrides: { properties: { alert: true } }
+      responses:
+        "201":
+          description: Spawned.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SpawnResult" }
+              example:
+                created:
+                  - { alias: "skeleton#1", parent: skeleton, rev: 1 }
+                  - { alias: "skeleton#2", parent: skeleton, rev: 1 }
+                relations:
+                  - { id: rel_a1, type: in, from: "skeleton#1", to: crypt }
+
+  /v1/worlds/{world}/entities/{room}/blocking:
+    put:
+      tags: [geometry]
+      operationId: setBlocking
+      summary: Set a room's blocking layer (walls / cover as a mechanic).
+      description: >
+        The blocking layer is the wall as a mechanic (not the wall sprite). Each cell carries a `blocks`
+        flag: `wall` (default; blocks move and sight), `move` (rubble, pit edge), or `sight` (cover,
+        smoke). `PUT` replaces the whole layer; `PATCH` adds/removes individual cells for incremental
+        editing.
+      parameters:
+        - $ref: "#/components/parameters/world"
+        - name: room
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BlockingPut" }
+            example:
+              cells:
+                - { cell: [1, 0, 0] }
+                - { cell: [1, 1, 0] }
+                - { cell: [3, 2, 0], blocks: sight }
+      responses:
+        "200":
+          description: Layer set.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BlockingResult" }
+              example:
+                room: crypt
+                rev: 2
+                cells:
+                  - { cell: [1, 0, 0], blocks: wall }
+                  - { cell: [3, 2, 0], blocks: sight }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [geometry]
+      operationId: patchBlocking
+      summary: Add/remove individual blocking cells.
+      parameters:
+        - $ref: "#/components/parameters/world"
+        - name: room
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BlockingPatch" }
+            example:
+              add: [ { cell: [2, 2, 0], blocks: move } ]
+              remove: [ { cell: [1, 0, 0] } ]
+      responses:
+        "200":
+          description: Layer updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BlockingResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/worlds/{world}/entities/{alias}/light:
+    put:
+      tags: [geometry]
+      operationId: setLight
+      summary: Set an entity's light source (convenience shape).
+      description: >
+        Sets luminosity (`lit`, `light_level`) on the entity and, when `radius` is given, marks it as
+        illuminating entities in range. A convenience shape over the underlying luminosity + overlay
+        primitives.
+      parameters:
+        - $ref: "#/components/parameters/world"
+        - $ref: "#/components/parameters/alias"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LightPut" }
+            example: { lit: true, light_level: 3, radius: 6 }
+      responses:
+        "200":
+          description: Light set.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PropertyResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/worlds/{world}/entities/{alias}/triggers:
+    post:
+      tags: [triggers]
+      operationId: attachTrigger
+      summary: Attach a versioned trigger body to an entity.
+      description: >
+        A trigger is a first-class versioned resource carrying script source. It is one handler addressed
+        by `stage` + `event` (the slot key `<stage>:<event>`, lowercased). Stage is one of
+        Test, InsteadOf, Before, On, After, Report. One body per slot per entity (a second is
+        `409 slot_conflict`). Each write to a slot bumps `version` and retains prior bodies. Bodies are
+        validated at author time against the sandbox surface; a Report-stage event-fire or a
+        non-supported language is rejected.
+      parameters:
+        - $ref: "#/components/parameters/world"
+        - $ref: "#/components/parameters/alias"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TriggerCreate" }
+            example:
+              stage: On
+              event: Attack
+              language: luau
+              source: "local r = dice_eval('2d6+4')\nengine.set_prop(ctx.actor, 'rattled', true)"
+              when: "not flag(throne_audience_started)"
+      responses:
+        "201":
+          description: Attached.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TriggerRecord" }
+              example:
+                slot: "on:Attack"
+                alias: "skeleton#1"
+                version: 1
+                rev: 1
+                language: luau
+                content_hash: "sha256:9c1e..."
+                when: "not flag(throne_audience_started)"
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Error" }
+
+  /v1/worlds/{world}/entities/{alias}/triggers/{slot}/versions:
+    get:
+      tags: [triggers]
+      operationId: listTriggerVersions
+      summary: List the version history of a trigger slot.
+      parameters:
+        - $ref: "#/components/parameters/world"
+        - $ref: "#/components/parameters/alias"
+        - name: slot
+          in: path
+          required: true
+          schema: { type: string }
+          description: The slot key, e.g. "on:Attack".
+      responses:
+        "200":
+          description: Versions, newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/TriggerRecord" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/worlds/{world}/lower:
+    post:
+      tags: [lowering]
+      operationId: lowerWorld
+      summary: Compile the authoring graph to a runtime artifact.
+      description: >
+        Compiles the world to a runtime artifact the engine loads, and returns a reference plus a
+        content hash and resource counts. This is the only step that crosses into runtime territory;
+        from here play and live state ride Contract C1 + C2.
+      parameters:
+        - $ref: "#/components/parameters/world"
+      responses:
+        "200":
+          description: Lowered.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LowerResult" }
+              example:
+                artifact: floor.lua
+                graph_hash: "sha256:1ab..."
+                entities: 9
+                relations: 14
+                triggers: 3
+                runtime_contract: { commands: C1, state: C2 }
+        "422": { $ref: "#/components/responses/Error" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Bearer token identifying an authorized author for the target world.
+
+  parameters:
+    world:
+      name: world
+      in: path
+      required: true
+      schema: { type: string }
+      description: The top authoring container (a floor, hub, or catalog).
+    alias:
+      name: alias
+      in: path
+      required: true
+      schema: { type: string }
+      description: The author-stable entity id.
+    idempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string }
+      description: Optional key making an unsafe POST safely replayable.
+
+  responses:
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Conflict:
+      description: Conflict (rev mismatch or structural invariant violation).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+          example:
+            error:
+              code: cardinality_violation
+              message: "relation 'in' is various-to-one; 'altar' already has an 'in' edge"
+              alias: altar
+    Error:
+      description: Validation or request error.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      description: The uniform error shape for this API.
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              description: >
+                Machine-readable code, e.g. rev_conflict, cardinality_violation, exclusion_violation,
+                acyclicity_violation, slot_conflict, not_found, validation_error.
+            message: { type: string }
+            alias: { type: string }
+          required: [code, message]
+      required: [error]
+
+    WorldRecord:
+      type: object
+      properties:
+        world: { type: string }
+      required: [world]
+
+    Value:
+      description: >
+        A variant property value: scalar (string, boolean, integer, float), a dice-expression string
+        (e.g. "2d6+4"), a list, or a nested object.
+      anyOf:
+        - { type: string }
+        - { type: boolean }
+        - { type: number }
+        - { type: "null" }
+        - { type: array }
+        - { type: object }
+
+    PropertyBag:
+      type: object
+      description: A schemaless bag of variant property values.
+      additionalProperties: { $ref: "#/components/schemas/Value" }
+
+    EntityCreate:
+      type: object
+      properties:
+        alias: { type: string, minLength: 1, description: Author-stable id. }
+        name: { type: string, default: "", description: Display name. }
+        kind: { type: [string, "null"], description: Prototype edge; sugar for parent. }
+        parent: { type: [string, "null"], description: Explicit prototype override; null resolves from kind. }
+        prose: { type: string, default: "", description: Literate prose stored as runtime data. }
+        properties: { $ref: "#/components/schemas/PropertyBag" }
+      required: [alias]
+
+    EntityPatch:
+      type: object
+      description: Partial update; omitted fields are unchanged.
+      properties:
+        name: { type: [string, "null"] }
+        kind: { type: [string, "null"] }
+        parent: { type: [string, "null"] }
+        prose: { type: [string, "null"] }
+        if_rev: { type: integer, description: Optimistic-concurrency guard. }
+
+    EntityRecord:
+      type: object
+      properties:
+        alias: { type: string }
+        id: { type: [integer, "null"], description: Runtime id; null until the world is lowered. }
+        rev: { type: integer }
+        name: { type: string }
+        kind: { type: [string, "null"] }
+        parent: { type: [string, "null"], description: Resolved prototype chain root. }
+        prose: { type: string, default: "" }
+        properties: { $ref: "#/components/schemas/PropertyBag" }
+        lifecycle: { type: string, enum: [active, inactive], default: active }
+      required: [alias, rev, name]
+
+    PropertyPatch:
+      type: object
+      properties:
+        set: { $ref: "#/components/schemas/PropertyBag" }
+        remove: { type: array, items: { type: string } }
+        if_rev: { type: integer }
+
+    PropertyResult:
+      type: object
+      properties:
+        alias: { type: string }
+        rev: { type: integer }
+        properties: { $ref: "#/components/schemas/PropertyBag" }
+      required: [alias, rev, properties]
+
+    RelationTypeCreate:
+      type: object
+      properties:
+        name: { type: string, minLength: 1 }
+        directionality: { type: string, enum: [directed, undirected], default: directed }
+        cardinality:
+          type: string
+          enum: [one-to-one, one-to-various, various-to-one, various-to-various]
+          default: various-to-various
+        role:
+          type: string
+          enum: [none, containment, support, incorporation, map, portal, sensory]
+          default: none
+        symmetry: { type: string, enum: [symmetric, asymmetric], default: asymmetric }
+        exclusion_group:
+          type: [string, "null"]
+          description: Edges sharing a group are mutually exclusive on a node (e.g. "location").
+        invariants:
+          type: array
+          items: { type: string, enum: [acyclic] }
+        payload_schema:
+          type: object
+          description: Optional shape for edge payloads.
+          additionalProperties: true
+      required: [name]
+
+    RelationTypeRecord:
+      allOf:
+        - $ref: "#/components/schemas/RelationTypeCreate"
+        - type: object
+          properties:
+            rev: { type: integer }
+
+    RelationCreate:
+      type: object
+      properties:
+        type: { type: string, minLength: 1 }
+        from: { type: string, minLength: 1, description: Source entity alias. }
+        to: { type: string, minLength: 1, description: Target entity alias. }
+        payload:
+          type: object
+          description: "Edge payload (e.g. a position `{cell: [x,y,z]}`)."
+          additionalProperties: { $ref: "#/components/schemas/Value" }
+        if_rev: { type: integer }
+      required: [type, from, to]
+
+    RelationRecord:
+      type: object
+      properties:
+        id: { type: string }
+        rev: { type: integer }
+        type: { type: string }
+        from: { type: string }
+        to: { type: string }
+        role: { type: string }
+        cardinality: { type: string }
+        exclusion_group: { type: [string, "null"] }
+        payload:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/Value" }
+      required: [id, type, from, to]
+
+    ImportCreate:
+      type: object
+      properties:
+        catalog: { type: string, description: The catalog (world) to import. }
+        ref: { type: string, description: Version reference to pin. }
+      required: [catalog, ref]
+
+    ImportRecord:
+      type: object
+      properties:
+        catalog: { type: string }
+        ref: { type: string }
+      required: [catalog, ref]
+
+    SpawnRequest:
+      type: object
+      properties:
+        template: { type: string, description: Template alias to instantiate from. }
+        count: { type: integer, minimum: 1 }
+        into: { type: [string, "null"], description: Container alias to place instances into. }
+        alias_prefix: { type: string, description: Prefix for generated instance aliases. }
+        overrides:
+          type: object
+          description: "Per-instance overrides (e.g. `{properties: {...}}`)."
+          properties:
+            properties: { $ref: "#/components/schemas/PropertyBag" }
+          additionalProperties: true
+      required: [template, count]
+
+    SpawnResult:
+      type: object
+      properties:
+        created:
+          type: array
+          items:
+            type: object
+            properties:
+              alias: { type: string }
+              parent: { type: string }
+              rev: { type: integer }
+        relations:
+          type: array
+          items: { $ref: "#/components/schemas/RelationRecord" }
+      required: [created]
+
+    Cell:
+      type: array
+      description: An integer cell coordinate [x, y, z].
+      items: { type: integer }
+      minItems: 3
+      maxItems: 3
+
+    BlockingCell:
+      type: object
+      properties:
+        cell: { $ref: "#/components/schemas/Cell" }
+        blocks:
+          type: string
+          enum: [wall, move, sight]
+          default: wall
+          description: wall = blocks move + sight; move = move only; sight = sight only.
+      required: [cell]
+
+    BlockingPut:
+      type: object
+      properties:
+        cells:
+          type: array
+          items: { $ref: "#/components/schemas/BlockingCell" }
+      required: [cells]
+
+    BlockingPatch:
+      type: object
+      properties:
+        add: { type: array, items: { $ref: "#/components/schemas/BlockingCell" } }
+        remove: { type: array, items: { type: object, properties: { cell: { $ref: "#/components/schemas/Cell" } }, required: [cell] } }
+
+    BlockingResult:
+      type: object
+      properties:
+        room: { type: string }
+        rev: { type: integer }
+        cells:
+          type: array
+          items: { $ref: "#/components/schemas/BlockingCell" }
+      required: [room, cells]
+
+    LightPut:
+      type: object
+      properties:
+        lit: { type: boolean }
+        light_level: { type: integer }
+        radius: { type: [integer, "null"], description: Illumination radius; null = container-wide. }
+      required: [lit]
+
+    TriggerCreate:
+      type: object
+      properties:
+        stage:
+          type: string
+          enum: [Test, InsteadOf, Before, On, After, Report]
+        event: { type: string, minLength: 1 }
+        language: { type: string, default: luau }
+        source: { type: string, minLength: 1, description: Trigger body source. }
+        when: { type: [string, "null"], description: Optional predicate guard. }
+      required: [stage, event, source]
+
+    TriggerRecord:
+      type: object
+      properties:
+        slot: { type: string, description: "The slot key <stage>:<event>, lowercased (e.g. on:Attack)." }
+        alias: { type: string }
+        version: { type: integer }
+        rev: { type: integer }
+        language: { type: string }
+        content_hash: { type: string }
+        when: { type: [string, "null"] }
+      required: [slot, alias, version, rev]
+
+    LowerResult:
+      type: object
+      properties:
+        artifact: { type: string, description: Reference to the produced runtime artifact. }
+        graph_hash: { type: string }
+        entities: { type: integer }
+        relations: { type: integer }
+        triggers: { type: integer }
+        runtime_contract:
+          type: object
+          properties:
+            commands: { type: string, description: 'The runtime command contract (C1).' }
+            state: { type: string, description: 'The runtime state contract (C2).' }
+      required: [artifact, graph_hash]

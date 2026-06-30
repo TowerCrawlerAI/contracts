@@ -1,0 +1,111 @@
+openapi: 3.1.0
+info:
+  title: Tapestry Control Plane — Economy Ledger
+  version: "0.0.0-draft"
+  summary: Transactional item ledger enforcing the item-singleton invariant (PLANNED — not yet implemented).
+  description: >
+    DRAFT / PLANNED. The economy ledger is the transactional system of record for item ownership. It
+    enforces the **item-singleton invariant** (Contract C2 §6): every portable item instance has a
+    platform-unique `item_id` and exists in exactly one place platform-wide at any instant — a character
+    blob, a live instance, the ledger (in-flight), or a hub floor. Every transfer (an instance handoff,
+    or a buy/sell) is a single atomic transaction, never two independent writes, so the classic
+    duplication exploit cannot occur.
+
+
+    This service is NOT yet built. The shapes below are derived from the documented design intent and are
+    SUBJECT TO CHANGE. They are published to show the planned surface, not as a frozen contract.
+servers:
+  - url: http://localhost:8000
+    description: Control-plane service (planned).
+security:
+  - bearerAuth: []
+tags:
+  - name: ledger
+
+paths:
+  /v1/items/{item_id}:
+    get:
+      tags: [ledger]
+      operationId: getItem
+      summary: Read an item's current owner of record + instance state. (PLANNED)
+      parameters: [ { $ref: "#/components/parameters/itemId" } ]
+      responses:
+        "200":
+          description: Item ledger record.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ItemRecord" }
+              example:
+                item_id: "itm:9f3a"
+                owner: { kind: character, id: "chr-77" }
+                prototype: "dnd5e/items/holy_avenger"
+                props: { charges: 2, attunement: "acct:abc123" }
+        "404": { description: Not found. }
+
+  /v1/transfers:
+    post:
+      tags: [ledger]
+      operationId: transferItem
+      summary: Atomically move an item between owners (handoff / buy / sell). (PLANNED)
+      description: >
+        Asserts the item's current owner matches `from`, then in one atomic transaction moves it to
+        `to` (optionally via the in-flight owner). If the assert fails (the item already moved) the whole
+        transfer aborts with `409` — no duplication. The same operation models an instance handoff and a
+        buy/sell trade.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TransferRequest" }
+            example:
+              item_id: "itm:9f3a"
+              from: { kind: instance, id: "bonegarden#a3f" }
+              to: { kind: character, id: "chr-77" }
+              expected_props: { charges: 2 }
+      responses:
+        "200":
+          description: Transferred.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ItemRecord" }
+        "409":
+          description: Ownership assertion failed (item already moved) — aborted, no change.
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    itemId:
+      name: item_id
+      in: path
+      required: true
+      schema: { type: string }
+  schemas:
+    Owner:
+      type: object
+      description: An item owner of record.
+      properties:
+        kind: { type: string, enum: [character, instance, ledger, floor], description: "ledger = in-flight." }
+        id: { type: string }
+      required: [kind, id]
+    ItemRecord:
+      type: object
+      properties:
+        item_id: { type: string, description: Platform-unique item instance id. }
+        owner: { $ref: "#/components/schemas/Owner" }
+        prototype: { type: [string, "null"], description: Catalog prototype id, if scripted. }
+        props: { type: object, additionalProperties: true, description: Mutable instance state. }
+      required: [item_id, owner]
+    TransferRequest:
+      type: object
+      properties:
+        item_id: { type: string }
+        from: { $ref: "#/components/schemas/Owner" }
+        to: { $ref: "#/components/schemas/Owner" }
+        expected_props:
+          type: object
+          additionalProperties: true
+          description: Optional optimistic guard on the item's instance state.
+      required: [item_id, from, to]

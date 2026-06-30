@@ -1,0 +1,144 @@
+openapi: 3.1.0
+info:
+  title: Tapestry Control Plane — Leaderboards
+  version: "0.0.0-draft"
+  summary: Per-floor best-run leaderboards, commit-reveal verified (PLANNED — not yet implemented).
+  description: >
+    DRAFT / PLANNED. Records and ranks completed runs per floor, with seed integrity enforced by a
+    commit-reveal scheme: a run commits to a seed hash before it starts, then reveals the seed on
+    submission; the service validates the revealed seed against its pre-published hash before accepting
+    the run.
+
+
+    This service is NOT yet built. The shapes below are derived from the documented design intent and are
+    SUBJECT TO CHANGE. They are published to show the planned surface, not as a frozen contract.
+servers:
+  - url: http://localhost:8000
+    description: Control-plane service (planned).
+security:
+  - bearerAuth: []
+tags:
+  - name: leaderboards
+
+paths:
+  /v1/floors/{floor_id}/commits:
+    post:
+      tags: [leaderboards]
+      operationId: commitSeed
+      summary: Commit to a seed hash before a run starts. (PLANNED)
+      description: >
+        Pre-publishes a hash of the run's seed so the seed cannot be cherry-picked after the fact.
+        Returns a commit id the run later references on submission.
+      parameters: [ { $ref: "#/components/parameters/floorId" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SeedCommit" }
+            example: { owner_uid: "uid-abc123", seed_hash: "sha256:7c1f..." }
+      responses:
+        "201":
+          description: Committed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitRecord" }
+              example: { commit_id: "cmt-001", floor_id: bone_garden, seed_hash: "sha256:7c1f...", committed_at: "2026-06-30T12:00:00Z" }
+
+  /v1/floors/{floor_id}/runs:
+    post:
+      tags: [leaderboards]
+      operationId: submitRun
+      summary: Submit a completed run, revealing the seed. (PLANNED)
+      description: >
+        Submits a completed run with its revealed seed and result. The service rejects the run with
+        `422` if the revealed seed does not hash to the committed `seed_hash`.
+      parameters: [ { $ref: "#/components/parameters/floorId" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RunSubmission" }
+            example:
+              commit_id: "cmt-001"
+              owner_uid: "uid-abc123"
+              character_id: "chr-77"
+              seed: "0xC0FFEE"
+              score: 12840
+              duration_ms: 754000
+      responses:
+        "201":
+          description: Accepted and ranked.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunRecord" }
+        "422":
+          description: Revealed seed does not match the committed hash.
+    get:
+      tags: [leaderboards]
+      operationId: listRuns
+      summary: List ranked runs for a floor. (PLANNED)
+      parameters:
+        - { $ref: "#/components/parameters/floorId" }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        "200":
+          description: Ranked runs, best first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/RunRecord" }
+              example:
+                - { run_id: "run-9", rank: 1, character_id: "chr-77", owner_uid: "uid-abc123", score: 12840, duration_ms: 754000, verified: true }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    floorId:
+      name: floor_id
+      in: path
+      required: true
+      schema: { type: string }
+  schemas:
+    SeedCommit:
+      type: object
+      properties:
+        owner_uid: { type: string }
+        seed_hash: { type: string, description: Hash of the run seed, published before the run. }
+      required: [owner_uid, seed_hash]
+    CommitRecord:
+      type: object
+      properties:
+        commit_id: { type: string }
+        floor_id: { type: string }
+        seed_hash: { type: string }
+        committed_at: { type: string, format: date-time }
+      required: [commit_id, floor_id, seed_hash]
+    RunSubmission:
+      type: object
+      properties:
+        commit_id: { type: string }
+        owner_uid: { type: string }
+        character_id: { type: string }
+        seed: { type: string, description: The revealed seed; must hash to the committed seed_hash. }
+        score: { type: integer }
+        duration_ms: { type: integer }
+      required: [commit_id, owner_uid, seed, score]
+    RunRecord:
+      type: object
+      properties:
+        run_id: { type: string }
+        rank: { type: integer }
+        floor_id: { type: string }
+        character_id: { type: string }
+        owner_uid: { type: string }
+        score: { type: integer }
+        duration_ms: { type: integer }
+        verified: { type: boolean, description: Seed verified against the commit. }
+      required: [run_id, score]

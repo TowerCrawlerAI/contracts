@@ -1,0 +1,234 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.tapestry.dev/state/portable-state.schema.json",
+  "title": "Tapestry Portable State (Contract C2)",
+  "description": "Two deliberately-separate schemas: (1) the durable portable character blob that crosses every instance handoff (join, leave, portal), and (2) the live JSON state-export the engine returns on demand (query_state). They share value encodings but are not the same blob. This schema is the source of truth for both shapes plus their supporting types (items, conditions).",
+
+  "$defs": {
+    "scalar": {
+      "description": "A scalar property value: string, boolean, integer, or float. Dice-expressions travel as their canonical string (e.g. \"1d8\").",
+      "type": ["string", "boolean", "number", "null"]
+    },
+
+    "propBag": {
+      "type": "object",
+      "description": "A schemaless bag of property values. Scalar values are guaranteed-portable; list values are permitted on the durable blob's `props`.",
+      "additionalProperties": true
+    },
+
+    "portableStats": {
+      "type": "object",
+      "description": "Character statistics. The minimum guaranteed-portable actor stat set is `hp`, `max_hp`, `ac`, `level` (Contract rule C2-1). Other actor scalars are NOT guaranteed to portal until explicitly added to the portable set; consumers must not assume an arbitrary actor scalar (e.g. `strength`, `xp`) survives a handoff.",
+      "properties": {
+        "hp": { "type": "integer", "description": "Current hit points (guaranteed-portable)." },
+        "max_hp": { "type": "integer", "description": "Maximum hit points (guaranteed-portable)." },
+        "ac": { "type": "integer", "description": "Armor class (guaranteed-portable)." },
+        "level": { "type": "integer", "description": "Character level (guaranteed-portable)." }
+      },
+      "additionalProperties": true
+    },
+
+    "item": {
+      "type": "object",
+      "description": "A carried/worn item. At minimum `{name, props}`. Any scalar property on an item is guaranteed-portable, round-tripped by type (string/bool/int/float) — this is the OPEN portable surface (Contract rule C2-1). A scripted item travels by reference: it carries a `prototype` catalog id plus its mutable instance state only, never executable behaviour (Contract rule C2-2).",
+      "properties": {
+        "name": { "type": "string" },
+        "item_id": {
+          "type": "string",
+          "description": "Platform-unique item instance id, minted by the control-plane (NOT an engine node id). At any instant an item_id is owned by exactly one place platform-wide; handoff is a single atomic transaction (Contract rule C2-4)."
+        },
+        "prototype": {
+          "type": "string",
+          "description": "Catalog prototype id for a scripted/structured item (e.g. \"dnd5e/items/holy_avenger\"). Resolves to the item's static props + behaviour in the catalog (Contract C4). When present, only mutable instance state travels in `props`."
+        },
+        "props": {
+          "$ref": "#/$defs/propBag",
+          "description": "For a scalar item: all its scalar properties. For a prototype-referenced item: ONLY the mutable instance state that has diverged from the prototype (e.g. remaining charges, attunement, equipped slot)."
+        }
+      },
+      "required": ["name"],
+      "additionalProperties": true
+    },
+
+    "condition": {
+      "type": "object",
+      "description": "A detached snapshot of an effect/condition (an overlay), travelling as parameters rather than as a live cross-process edge (Contract rule C2-3). A character's inbound effects are serialized by classifying each by where its source lives: self-sourced and item-sourced effects travel; a foreign timed effect travels as a detached, decaying copy with its remaining duration; a concentration/aura effect that requires its source in scope is dropped at the boundary.",
+      "properties": {
+        "property": { "type": "string", "description": "The property the effect modifies (e.g. \"attack_bonus\")." },
+        "op": { "type": "string", "enum": ["set", "add", "mul", "clamp", "tag"], "description": "How the effect modifies the property." },
+        "magnitude": { "$ref": "#/$defs/scalar", "description": "The amount/value of the modification." },
+        "precedence": { "type": "integer", "description": "Fold order relative to other overlays." },
+        "remaining_duration": { "type": "integer", "description": "Ticks of duration remaining (for timed effects)." },
+        "source_class": {
+          "type": "string",
+          "enum": ["self", "item", "foreign_timed", "foreign_aura"],
+          "description": "Classifies the effect's source for portability (Contract rule C2-3)."
+        },
+        "label": { "type": "string", "description": "Human-readable name (e.g. \"blessed\")." }
+      },
+      "required": ["property", "op"],
+      "additionalProperties": false
+    },
+
+    "portableCharacterBlob": {
+      "type": "object",
+      "title": "Portable character blob (store-side, durable)",
+      "description": "The durable portable unit (control-plane / Plane 3): identity + inventory + stats + knowledge, as three independently-queryable fields. This is the truth that survives between instances.",
+      "properties": {
+        "inventory": {
+          "type": "array",
+          "description": "Carried/worn items; each is a content data blob the store does not interpret.",
+          "items": { "$ref": "#/$defs/item" }
+        },
+        "stats": { "$ref": "#/$defs/portableStats" },
+        "props": {
+          "$ref": "#/$defs/propBag",
+          "description": "Miscellaneous properties + knowledge. List-valued props (e.g. visited rooms) live here."
+        },
+        "conditions": {
+          "type": "array",
+          "description": "Optional list of detached effect snapshots (Contract rule C2-3). Absent on legacy blobs ⇒ no conditions.",
+          "items": { "$ref": "#/$defs/condition" }
+        }
+      },
+      "required": ["inventory", "stats", "props"],
+      "additionalProperties": false
+    },
+
+    "engineActorBlob": {
+      "type": "object",
+      "title": "Engine-side actor blob (spawn/despawn seam)",
+      "description": "What the engine consumes on `spawn_actor` and produces on `despawn_actor` (Contract C1). The engine keeps a single `props` bag, so the durable `{stats, props}` split is merged into `props` on the way in (stats override props on key collision) and the whole bag returns to the store's `props` on the way out. NOTE: an empty item set may serialize as `{}` rather than `[]`; coerce to a list.",
+      "properties": {
+        "name": { "type": "string" },
+        "props": { "$ref": "#/$defs/propBag", "description": "Merged stats + misc props for the actor node." },
+        "items": {
+          "type": "array",
+          "description": "Carried/worn items in engine-side form.",
+          "items": { "$ref": "#/$defs/item" }
+        }
+      },
+      "required": ["name"],
+      "additionalProperties": false
+    },
+
+    "stateExport": {
+      "type": "object",
+      "title": "JSON state export (query_state response)",
+      "description": "The engine's current live view as JSON, returned by the C1 `query_state` command. A pure read: it carries the current tick and never mutates state. It is a SUPERSET of the portable blob in live engine terms (it includes live node ids and the full effective view); the portable blob is a lossy, durable projection of it.",
+      "properties": {
+        "type": { "const": "state" },
+        "tick": { "type": "integer", "minimum": 0 },
+        "scope": { "type": "string", "enum": ["actor", "room", "graph"] },
+        "node": {
+          "type": "object",
+          "description": "Single-actor projection (scope=actor): the live actor with effective props, location, items, conditions, and relations.",
+          "properties": {
+            "id": { "type": "integer", "description": "Live engine node id (per-session, not durable)." },
+            "name": { "type": "string" },
+            "kind": { "type": "string" },
+            "props": { "$ref": "#/$defs/propBag" },
+            "location": {
+              "type": "object",
+              "properties": {
+                "rel": { "type": "string", "enum": ["in", "on", "carried", "worn"] },
+                "container": { "type": "integer" },
+                "cell": {
+                  "type": "object",
+                  "properties": {
+                    "x": { "type": "integer" },
+                    "y": { "type": "integer" },
+                    "z": { "type": "integer" }
+                  }
+                }
+              }
+            },
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": { "type": "integer" },
+                  "name": { "type": "string" },
+                  "slot": { "type": "string" },
+                  "prototype": { "type": "string" },
+                  "props": { "$ref": "#/$defs/propBag" }
+                }
+              }
+            },
+            "conditions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "description": "A live overlay in engine terms, including its in-graph `source` node id.",
+                "properties": {
+                  "source": { "type": "integer" },
+                  "property": { "type": "string" },
+                  "op": { "type": "string" },
+                  "magnitude": { "$ref": "#/$defs/scalar" },
+                  "precedence": { "type": "integer" },
+                  "remaining_duration": { "type": "integer" },
+                  "label": { "type": "string" }
+                }
+              }
+            },
+            "relations": {
+              "type": "object",
+              "description": "Outbound relation sets keyed by relation type (e.g. has-seen, knows, part-of).",
+              "additionalProperties": { "type": "array", "items": { "type": "integer" } }
+            }
+          }
+        },
+        "data": {
+          "type": "object",
+          "description": "Graph/room projection (scope=room|graph): nodes and edges.",
+          "properties": {
+            "nodes": { "type": "array", "items": { "type": "object" } },
+            "edges": { "type": "array", "items": { "type": "object" } }
+          }
+        }
+      },
+      "required": ["type", "tick"],
+      "additionalProperties": true
+    }
+  },
+
+  "oneOf": [
+    { "$ref": "#/$defs/portableCharacterBlob" },
+    { "$ref": "#/$defs/engineActorBlob" },
+    { "$ref": "#/$defs/stateExport" }
+  ],
+
+  "examples": [
+    {
+      "inventory": [
+        { "item_id": "itm:9f3a", "name": "Dawnbreaker", "prototype": "dnd5e/items/holy_avenger",
+          "props": { "slot": "carried", "charges": 2, "attunement": "acct:abc123" } }
+      ],
+      "stats": { "hp": 6, "max_hp": 30, "ac": 16, "level": 5 },
+      "props": { "visited_rooms": [101, 104] },
+      "conditions": [
+        { "property": "attack_bonus", "op": "add", "magnitude": 1, "precedence": 100,
+          "remaining_duration": 6, "source_class": "foreign_timed", "label": "blessed" }
+      ]
+    },
+    {
+      "name": "Tessera",
+      "props": { "hp": 24, "max_hp": 30, "ac": 16, "level": 5 },
+      "items": [ { "name": "iron dagger", "props": { "damage": "1d4", "slot": "carried" } } ]
+    },
+    {
+      "type": "state", "tick": 87, "scope": "actor",
+      "node": {
+        "id": 42, "name": "Tessera", "kind": "actor",
+        "props": { "hp": 6, "max_hp": 30, "ac": 16, "level": 5 },
+        "location": { "rel": "in", "container": 104, "cell": { "x": 3, "y": 1, "z": 0 } },
+        "items": [ { "id": 51, "name": "Dawnbreaker", "slot": "carried",
+                     "prototype": "dnd5e/items/holy_avenger", "props": { "charges": 2 } } ],
+        "conditions": [ { "source": 33, "property": "attack_bonus", "op": "add", "magnitude": 1,
+                          "precedence": 100, "remaining_duration": 6, "label": "blessed" } ],
+        "relations": { "has-seen": [101, 104], "knows": [], "part-of": [] }
+      }
+    }
+  ]
+}

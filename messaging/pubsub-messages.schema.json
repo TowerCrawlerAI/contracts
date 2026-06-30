@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.tapestry.dev/messaging/pubsub-messages.schema.json",
+  "title": "Tapestry Pub/Sub Messages",
+  "description": "Schemas for everything passed over a message bus / queue / stream. Two message families: (a) queueable COMMAND messages — the C1 commands (input/action/host-control) framed as bus messages a producer enqueues for an engine session; and (b) SKEIN EVENT messages — the C1 event envelope framed as published events a session emits for subscribers. Where possible these reference the engine command/event protocol schema (C1) rather than duplicating it. ORDERING/DETERMINISM: per session, commands are consumed in a single total order; the same seed plus the same ordered command sequence reproduces a byte-identical event stream, so the command stream is the durable replay input and the event stream is its deterministic projection. Producers MUST therefore order commands within a session by a monotonic sequence and consumers MUST NOT reorder them.",
+
+  "$defs": {
+
+    "sessionKey": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The ordering/partition key: the engine session (instance) a message belongs to. All messages for one session share this key so the bus preserves their relative order. Cross-session order is not defined and not required."
+    },
+
+    "topic": {
+      "type": "string",
+      "description": "Logical topic/stream identifier. Convention: `tapestry.commands.<session>` for the inbound command stream of a session, and `tapestry.skein.<session>` for its outbound event stream. A consumer subscribes to a session's skein topic; a producer publishes to its command topic.",
+      "examples": ["tapestry.commands.bonegarden-a3f", "tapestry.skein.bonegarden-a3f"]
+    },
+
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Monotonic per-session sequence number establishing total order within the session. Required on event messages; recommended on command messages so a broker that cannot guarantee FIFO can re-derive order."
+    },
+
+    "producedAt": { "type": "string", "format": "date-time", "description": "Producer timestamp (informational; never used for ordering)." },
+
+    "traceId": { "type": "string", "description": "Optional correlation id for tracing a request across services." },
+
+    "commandMessage": {
+      "type": "object",
+      "title": "Command message (queueable)",
+      "description": "A C1 command framed as a bus message and enqueued for a session's engine. The session's FIFO consumer applies commands in one total order. Because a command is pure data, it is durably enqueueable and replayable. Routing/ordering fields (message_type, topic, session, seq, produced_at, trace_id) are common to both message families.",
+      "properties": {
+        "message_type": { "const": "command" },
+        "topic": { "$ref": "#/$defs/topic" },
+        "session": { "$ref": "#/$defs/sessionKey" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "produced_at": { "$ref": "#/$defs/producedAt" },
+        "trace_id": { "$ref": "#/$defs/traceId" },
+        "idempotency_key": {
+          "type": "string",
+          "description": "Optional key so a redelivered command is applied at most once."
+        },
+        "command": {
+          "$ref": "../engine/command-event-protocol.schema.json#/$defs/command",
+          "description": "The C1 command payload (input / action / query_state / spawn_actor / despawn_actor / move_actor / rotate_actor / snapshot / restore / graph_hash / quit)."
+        }
+      },
+      "required": ["message_type", "session", "command"],
+      "additionalProperties": false
+    },
+
+    "eventMessage": {
+      "type": "object",
+      "title": "Skein event message (published)",
+      "description": "A C1 player-event envelope framed as a published bus message. The ordered sequence of event messages for a session IS the skein (the durable, replayable record). Host-control reply records (e.g. actor_spawned, state, graph_hash) are point-to-point command answers and are NOT part of this published event stream. Routing/ordering fields are common to both message families.",
+      "properties": {
+        "message_type": { "const": "event" },
+        "topic": { "$ref": "#/$defs/topic" },
+        "session": { "$ref": "#/$defs/sessionKey" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "produced_at": { "$ref": "#/$defs/producedAt" },
+        "trace_id": { "$ref": "#/$defs/traceId" },
+        "tick": { "type": "integer", "minimum": 0, "description": "The logical tick of the event (mirrors the envelope's tick)." },
+        "event": {
+          "$ref": "../engine/command-event-protocol.schema.json#/$defs/eventEnvelope",
+          "description": "The C1 event envelope {type:event, tick, event_type, event_name, data}."
+        }
+      },
+      "required": ["message_type", "session", "seq", "event"],
+      "additionalProperties": false
+    }
+  },
+
+  "oneOf": [
+    { "$ref": "#/$defs/commandMessage" },
+    { "$ref": "#/$defs/eventMessage" }
+  ],
+
+  "examples": [
+    {
+      "message_type": "command",
+      "topic": "tapestry.commands.bonegarden-a3f",
+      "session": "bonegarden-a3f",
+      "seq": 17,
+      "idempotency_key": "act-9f3a-17",
+      "command": { "type": "action", "actor": 42, "verb": "attack", "nouns": [51, 7], "params": {} }
+    },
+    {
+      "message_type": "event",
+      "topic": "tapestry.skein.bonegarden-a3f",
+      "session": "bonegarden-a3f",
+      "seq": 204,
+      "tick": 12,
+      "event": {
+        "type": "event", "tick": 12, "event_type": 2, "event_name": "STATE_CHANGE",
+        "data": { "entity": 7, "key": "hp", "before": 9, "after": 4 }
+      }
+    },
+    {
+      "message_type": "event",
+      "topic": "tapestry.skein.bonegarden-a3f",
+      "session": "bonegarden-a3f",
+      "seq": 205,
+      "tick": 12,
+      "event": {
+        "type": "event", "tick": 12, "event_type": 7, "event_name": "TURN_REQUEST",
+        "data": { "actor": 7 }
+      }
+    }
+  ]
+}

@@ -1,0 +1,211 @@
+openapi: 3.1.0
+info:
+  title: Tapestry Control Plane — Character Store
+  version: "1.0.0"
+  summary: CRUD on durable characters plus load/save of the portable state blob.
+  description: >
+    The character store is the durable home of a character: its identity plus the portable
+    `{inventory, stats, props}` blob (Contract C2). It exposes character CRUD, direct load/save of the
+    portable state, and a per-owner roster. Creation enforces a per-plan character cap (the billing
+    seam).
+servers:
+  - url: http://localhost:8000
+    description: Control-plane service.
+security:
+  - bearerAuth: []
+tags:
+  - name: characters
+  - name: roster
+
+paths:
+  /characters:
+    post:
+      tags: [characters]
+      operationId: createCharacter
+      summary: Create a character.
+      description: >
+        Creates a character and returns its full record. Enforces the per-plan character cap: an owner
+        at their plan's limit gets a `409` instead of an unbounded create.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CharacterCreate" }
+            example:
+              owner_uid: "uid-abc123"
+              name: Tessera
+              floor_id: bone_garden
+              state:
+                inventory: [ { name: "iron dagger", props: { damage: "1d4", slot: carried } } ]
+                stats: { hp: 24, max_hp: 30, ac: 16, level: 5 }
+                props: { visited_rooms: [101, 104] }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CharacterRecord" }
+        "409":
+          description: Per-plan character cap reached.
+
+  /characters/{character_id}:
+    get:
+      tags: [characters]
+      operationId: getCharacter
+      summary: Read a character's full record.
+      parameters: [ { $ref: "#/components/parameters/characterId" } ]
+      responses:
+        "200":
+          description: Character.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CharacterRecord" }
+        "404": { description: Not found. }
+    put:
+      tags: [characters]
+      operationId: updateCharacter
+      summary: Update name and/or portable state (partial).
+      parameters: [ { $ref: "#/components/parameters/characterId" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CharacterUpdate" }
+            example: { name: "Tessera the Bold" }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CharacterRecord" }
+        "404": { description: Not found. }
+    delete:
+      tags: [characters]
+      operationId: deleteCharacter
+      summary: Delete a character.
+      parameters: [ { $ref: "#/components/parameters/characterId" } ]
+      responses:
+        "204": { description: Deleted. }
+        "404": { description: Not found. }
+
+  /characters/{character_id}/state:
+    get:
+      tags: [characters]
+      operationId: loadState
+      summary: Load the portable {inventory, stats, props} blob.
+      parameters: [ { $ref: "#/components/parameters/characterId" } ]
+      responses:
+        "200":
+          description: Portable state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PortableState" }
+        "404": { description: Not found. }
+    put:
+      tags: [characters]
+      operationId: saveState
+      summary: Save (overwrite) the portable blob.
+      parameters: [ { $ref: "#/components/parameters/characterId" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PortableState" }
+            example:
+              inventory: []
+              stats: { hp: 6, max_hp: 30, ac: 16, level: 5 }
+              props: { visited_rooms: [101, 104] }
+      responses:
+        "200":
+          description: Saved.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PortableState" }
+        "404": { description: Not found. }
+
+  /accounts/{owner_uid}/characters:
+    get:
+      tags: [roster]
+      operationId: listForOwner
+      summary: List the roster of characters owned by an account.
+      parameters:
+        - name: owner_uid
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Roster.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/RosterEntry" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  parameters:
+    characterId:
+      name: character_id
+      in: path
+      required: true
+      schema: { type: string }
+
+  schemas:
+    PortableState:
+      type: object
+      description: >
+        The portable character blob (Contract C2): three independently-queryable fields. Inventory
+        items are content data blobs (each at minimum `{name, props}`) the store does not interpret.
+        See state/portable-state.schema.json for the full normative shape.
+      properties:
+        inventory:
+          type: array
+          items: { type: object, additionalProperties: true }
+        stats:
+          type: object
+          additionalProperties: true
+        props:
+          type: object
+          additionalProperties: true
+      required: [inventory, stats, props]
+
+    CharacterCreate:
+      type: object
+      properties:
+        owner_uid: { type: string, minLength: 1, description: Stable owner uid. }
+        name: { type: string, minLength: 1, description: Character display name. }
+        floor_id: { type: string, minLength: 1, description: Floor namespace the character belongs to. }
+        state: { $ref: "#/components/schemas/PortableState" }
+      required: [owner_uid, name, floor_id]
+
+    CharacterUpdate:
+      type: object
+      description: Partial; omitted fields are unchanged.
+      properties:
+        name: { type: [string, "null"] }
+        state: { $ref: "#/components/schemas/PortableState" }
+
+    CharacterRecord:
+      type: object
+      properties:
+        character_id: { type: string }
+        name: { type: string }
+        owner_uid: { type: string }
+        floor_id: { type: string }
+        state: { $ref: "#/components/schemas/PortableState" }
+      required: [character_id, name, owner_uid, floor_id, state]
+
+    RosterEntry:
+      type: object
+      properties:
+        character_id: { type: string }
+        name: { type: string }
+        pregen_id: { type: [string, "null"] }
+        sheet: { type: object, additionalProperties: true }
+        location: { type: object, additionalProperties: true }
+      required: [character_id, name]
