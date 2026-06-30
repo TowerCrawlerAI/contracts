@@ -1,0 +1,130 @@
+openapi: 3.1.0
+info:
+  title: Tapestry Control Plane — Catalog
+  version: "0.0.0-draft"
+  summary: Durable catalog of item/kind/floor prototypes (PLANNED — not yet implemented).
+  description: >
+    DRAFT / PLANNED. The catalog is the durable home of item/kind/floor prototypes. It is the read side
+    of the authoring API (Contract C4) and the place scripted (T2) items in a portable blob resolve
+    against: a portable item carries a `prototype` catalog id (e.g. "dnd5e/items/holy_avenger") plus its
+    mutable instance state, and the catalog supplies the prototype's static properties and behaviour
+    (Contract C2 §4).
+
+
+    This service is NOT yet built. The shapes below are derived from the documented design intent and are
+    SUBJECT TO CHANGE once the service is designed and implemented. They are published so consumers can
+    see the planned surface, not relied on as a frozen contract.
+servers:
+  - url: http://localhost:8000
+    description: Control-plane service (planned).
+security:
+  - bearerAuth: []
+tags:
+  - name: catalog
+
+paths:
+  /v1/catalogs:
+    get:
+      tags: [catalog]
+      operationId: listCatalogs
+      summary: List available catalogs and their versions. (PLANNED)
+      responses:
+        "200":
+          description: Catalogs.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/CatalogSummary" }
+              example:
+                - { catalog: stdlib, latest_ref: "0.2.0", refs: ["0.1.0", "0.2.0"] }
+                - { catalog: dnd5e, latest_ref: "0.3.1", refs: ["0.3.0", "0.3.1"] }
+
+  /v1/catalogs/{catalog}/prototypes:
+    get:
+      tags: [catalog]
+      operationId: listPrototypes
+      summary: List prototype ids in a catalog. (PLANNED)
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - name: ref
+          in: query
+          required: false
+          schema: { type: string }
+          description: Version reference; omit for the latest.
+      responses:
+        "200":
+          description: Prototype ids.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: string }
+              example: [ "dnd5e/items/holy_avenger", "dnd5e/monsters/skeleton" ]
+
+  /v1/catalogs/{catalog}/prototypes/{prototype_id}:
+    get:
+      tags: [catalog]
+      operationId: getPrototype
+      summary: Resolve a prototype to its static properties + behaviour reference. (PLANNED)
+      description: >
+        Returns a prototype's static property bag and a reference to its behaviour (triggers). This is
+        what an engine instance resolves a portable item's `prototype` id against on spawn.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - name: prototype_id
+          in: path
+          required: true
+          schema: { type: string }
+          description: 'Catalog-relative prototype id (e.g. "items/holy_avenger").'
+        - name: ref
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: Prototype.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PrototypeRecord" }
+              example:
+                prototype_id: "dnd5e/items/holy_avenger"
+                catalog: dnd5e
+                ref: "0.3.1"
+                kind: weapon
+                properties: { damage: "2d6", slot: carried, attunement_required: true }
+                triggers: [ "on:Attack", "on:Equip" ]
+        "404": { description: Not found. }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    catalog:
+      name: catalog
+      in: path
+      required: true
+      schema: { type: string }
+  schemas:
+    CatalogSummary:
+      type: object
+      properties:
+        catalog: { type: string }
+        latest_ref: { type: string }
+        refs: { type: array, items: { type: string } }
+      required: [catalog]
+    PrototypeRecord:
+      type: object
+      properties:
+        prototype_id: { type: string }
+        catalog: { type: string }
+        ref: { type: string }
+        kind: { type: [string, "null"] }
+        properties: { type: object, additionalProperties: true, description: Static property bag for the prototype. }
+        triggers:
+          type: array
+          items: { type: string }
+          description: Slot keys of the behaviour attached to the prototype.
+      required: [prototype_id, catalog]

@@ -1,0 +1,267 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.tapestry.dev/model/object-model.schema.json",
+  "title": "Tapestry Canonical Object Model (the BOM)",
+  "description": "The definitive, consumer-facing object model of the Tapestry game world — its bill of materials. The world is a labeled property graph: ENTITIES (nodes) connected by TYPED RELATIONS (edges), both carrying schemaless property bags. This schema formalizes the object types every other contract references: entities, the property-bag value types, kind/prototype inheritance, typed relations (with role/directionality/cardinality/exclusion-group/payload), and overlays (affects edges). C2 (portable state) and C4 (authoring) reference these shapes for entities, properties, relations, and overlays. This is a definitional schema: each $def describes the canonical shape of one object type.",
+
+  "$defs": {
+
+    "id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "An entity (node) identity: a monotonic, never-reused integer minted by the engine. Ids are stable for the life of a running session and grant O(1) access, but are NOT stable across sessions or instances. Durable cross-session identity is carried by aliases (authoring) and platform item ids (control plane), never by raw node ids."
+    },
+
+    "alias": {
+      "type": "string",
+      "minLength": 1,
+      "description": "An author-facing stable string name for an entity. Authors address entities by alias; the engine maps each alias to a runtime id at load. The alias is the durable handle; the id is the runtime handle."
+    },
+
+    "diceExpression": {
+      "type": "string",
+      "description": "A dice-expression value: a parsed-once, rollable-many-times expression stored as its canonical string (e.g. \"2d6+3\", \"1d20\", \"2d20kh1\"). A property value type in its own right.",
+      "examples": ["2d6+3", "1d20", "2d20kh1", "1d8"]
+    },
+
+    "rollResult": {
+      "type": "object",
+      "description": "A roll-result value: the structured outcome of evaluating a dice-expression. A property value type in its own right; serializes as this record so a roll is verifiable and presentable.",
+      "properties": {
+        "expr": { "type": "string", "description": "The expression that was rolled." },
+        "faces": { "type": "array", "items": { "type": "integer" }, "description": "Per-die face values." },
+        "kept": { "type": "array", "items": { "type": "integer" }, "description": "Faces kept (after keep-highest/lowest)." },
+        "dropped": { "type": "array", "items": { "type": "integer" }, "description": "Faces dropped." },
+        "modifier": { "type": "integer", "description": "Flat modifier applied." },
+        "total": { "type": "integer", "description": "Final total." },
+        "flags": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["nat20", "nat1", "exploded", "rerolled", "advantage", "disadvantage"] },
+          "description": "Notable outcome flags."
+        }
+      },
+      "required": ["expr", "total"],
+      "additionalProperties": false
+    },
+
+    "value": {
+      "title": "Property value (the variant system)",
+      "description": "A single value in a property bag. The variant value types are: scalar (string/boolean/integer/float), identifier (a symbolic name), prose (literate text), code (an authored script body), link (a reference to an entity by id or alias), list (an ordered list of values), dice-expression, and roll-result. A structured object value (e.g. a cell position `{x,y,z}`) may also appear in an edge payload. JSON cannot distinguish identifier/prose/code from a plain string at the type level, so those three are carried as strings and disambiguated by the property's role in content; dice-expression is a string matched by form; roll-result is the structured record above. (anyOf — a structured object may match more than one branch.)",
+      "anyOf": [
+        { "type": "string", "title": "scalar/identifier/prose/code/dice-expression (string-encoded)" },
+        { "type": "boolean", "title": "scalar (boolean)" },
+        { "type": "number", "title": "scalar (integer or float)" },
+        { "type": "null", "title": "absent" },
+        { "$ref": "#/$defs/link", "title": "link" },
+        { "$ref": "#/$defs/rollResult", "title": "roll-result" },
+        { "type": "array", "title": "list", "items": { "$ref": "#/$defs/value" } },
+        { "type": "object", "title": "structured object (e.g. cell payload)" }
+      ]
+    },
+
+    "link": {
+      "type": "object",
+      "description": "A link value: a typed reference to another entity, by runtime id or by author alias.",
+      "properties": {
+        "ref": { "description": "The referenced entity.", "oneOf": [ { "$ref": "#/$defs/id" }, { "$ref": "#/$defs/alias" } ] }
+      },
+      "required": ["ref"],
+      "additionalProperties": false
+    },
+
+    "propertyBag": {
+      "type": "object",
+      "title": "Property bag",
+      "description": "An unbounded, schemaless map of property keys to values. Carried by both entities (the node's own state, conceptually its reflexive self-edge) and relations (edge payloads). Any key is permitted; values follow the variant system.",
+      "additionalProperties": { "$ref": "#/$defs/value" }
+    },
+
+    "lifecycle": {
+      "type": "string",
+      "enum": ["active", "inactive", "dead", "destroyed"],
+      "description": "An entity's lifecycle state. Entities are never hard-deleted — they transition lifecycle state and are referenceable forever. Perception/scope queries gate on this state (a destroyed item is known-about but not perceived; a corpse is still seen)."
+    },
+
+    "entity": {
+      "type": "object",
+      "title": "Entity (node)",
+      "description": "The fundamental object: a node in the world graph. Carries an identity (id and/or alias), a property bag (its own state), an optional kind/prototype it delegates to, and a lifecycle state.",
+      "properties": {
+        "id": { "oneOf": [ { "$ref": "#/$defs/id" }, { "type": "null" } ], "description": "Runtime id; null before a graph is materialized/lowered." },
+        "alias": { "$ref": "#/$defs/alias" },
+        "name": { "type": "string", "description": "Display name." },
+        "kind": {
+          "type": ["string", "null"],
+          "description": "The prototype this entity delegates to (an `is-a` relationship). `kind` is sugar for `parent`: both name a prototype entity from which this one inherits properties and behaviour."
+        },
+        "parent": {
+          "type": ["string", "null"],
+          "description": "Explicit prototype override. Resolution order: explicit parent > kind > default > root."
+        },
+        "properties": { "$ref": "#/$defs/propertyBag", "description": "The entity's own property bag (its self-edge payload)." },
+        "lifecycle": { "$ref": "#/$defs/lifecycle", "default": "active" }
+      },
+      "anyOf": [
+        { "required": ["alias"] },
+        { "required": ["id"] }
+      ],
+      "additionalProperties": true
+    },
+
+    "effectiveEntity": {
+      "type": "object",
+      "title": "Effective entity (materialized view)",
+      "description": "An entity with its property bag FOLDED over its prototype (kind/parent) chain plus any active overlays — the materialized, effective view. Own properties layer on inherited ones; overlays then fold by precedence (see overlay). This is what perception and rules read.",
+      "allOf": [ { "$ref": "#/$defs/entity" } ],
+      "properties": {
+        "effective_properties": { "$ref": "#/$defs/propertyBag", "description": "Properties after folding inheritance + overlays." }
+      }
+    },
+
+    "role": {
+      "type": "string",
+      "enum": ["none", "containment", "support", "incorporation", "map", "portal", "sensory"],
+      "description": "The semantic role of a relation type, which determines how the engine's spatial/perception machinery treats it. none = a plain content relation the spatial walk ignores; containment = in-ness (location group); support = on-ness (location group); incorporation = part-of (structural, OUTSIDE the location exclusion group); map = room adjacency; portal = a passage/door between containers; sensory = a perception channel (see/touch/hear/smell/know)."
+    },
+
+    "sense": {
+      "type": "string",
+      "enum": ["see", "touch", "hear", "smell", "know"],
+      "description": "A sensory sub-channel, for relations and overlays with role=sensory. `know` is non-spatial (knowledge as a sense)."
+    },
+
+    "cardinality": {
+      "type": "string",
+      "enum": ["one-to-one", "one-to-various", "various-to-one", "various-to-various"],
+      "description": "The cardinality of a relation type, expressed as (source side) × (target side), each `one` or `various`. The `one` side is a single slot (setting a new edge replaces the old — that IS the move); the `various` side is an ordered set."
+    },
+
+    "directionality": {
+      "type": "string",
+      "enum": ["directed", "undirected"],
+      "description": "Whether the relation is directed (from → to) or undirected."
+    },
+
+    "symmetry": {
+      "type": "string",
+      "enum": ["symmetric", "asymmetric"],
+      "description": "A symmetric relation auto-maintains its reverse edge; an asymmetric one does not."
+    },
+
+    "relationType": {
+      "type": "object",
+      "title": "Relation type (edge schema)",
+      "description": "A first-class, declarable edge schema. The engine ships a built-in set (the location group in/on/carried/worn, plus map, support, incorporation/part-of, sensory channels, and has-seen); content declares more (factions, knowledge, quests). Roles are content-assignable.",
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "directionality": { "$ref": "#/$defs/directionality", "default": "directed" },
+        "cardinality": { "$ref": "#/$defs/cardinality", "default": "various-to-various" },
+        "symmetry": { "$ref": "#/$defs/symmetry", "default": "asymmetric" },
+        "role": { "$ref": "#/$defs/role", "default": "none" },
+        "sense": { "$ref": "#/$defs/sense", "description": "Sub-channel when role=sensory." },
+        "exclusion_group": {
+          "type": ["string", "null"],
+          "description": "Optional mutual-exclusion group. Relations sharing a group are mutually exclusive on a node: the location group {in, on, carried, worn} is various-to-one ACROSS the group (a thing is in exactly one of them; setting one auto-evicts the others)."
+        },
+        "invariants": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["acyclic"] },
+          "description": "Structural invariants enforced at edge-write. Acyclicity applies to containment/support/incorporation."
+        },
+        "payload_schema": {
+          "type": "object",
+          "description": "Optional shape of this relation's edge payload.",
+          "additionalProperties": true
+        }
+      },
+      "required": ["name"],
+      "additionalProperties": false
+    },
+
+    "relation": {
+      "type": "object",
+      "title": "Relation (edge)",
+      "description": "A typed, directed edge between two entities, with an optional property bag (payload). Structural invariants (cardinality, exclusion group, acyclicity) are enforced when the edge is written.",
+      "properties": {
+        "type": { "type": "string", "minLength": 1, "description": "The relation type name." },
+        "from": { "description": "Source entity, by id or alias.", "oneOf": [ { "$ref": "#/$defs/id" }, { "$ref": "#/$defs/alias" } ] },
+        "to": { "description": "Target entity, by id or alias.", "oneOf": [ { "$ref": "#/$defs/id" }, { "$ref": "#/$defs/alias" } ] },
+        "role": { "$ref": "#/$defs/role" },
+        "cardinality": { "$ref": "#/$defs/cardinality" },
+        "exclusion_group": { "type": ["string", "null"] },
+        "payload": {
+          "$ref": "#/$defs/propertyBag",
+          "description": "Edge payload. For a location-group edge this carries the entity's integer cell position `{x,y,z}` within its container (position is optional; absent or 0,0,0 for most entities)."
+        }
+      },
+      "required": ["type", "from", "to"],
+      "additionalProperties": false
+    },
+
+    "cell": {
+      "type": "object",
+      "title": "Cell position",
+      "description": "An integer cell coordinate within a container, carried on a location-group edge payload. Integers only — never floats (floats would break deterministic ordering).",
+      "properties": {
+        "x": { "type": "integer" },
+        "y": { "type": "integer" },
+        "z": { "type": "integer" }
+      },
+      "required": ["x", "y", "z"],
+      "additionalProperties": false
+    },
+
+    "overlayOp": {
+      "type": "string",
+      "enum": ["set", "add", "mul", "clamp", "tag"],
+      "description": "The declarative operation an overlay applies to a property. The closed op-algebra the engine folds without knowing content meaning. A modification needing arbitrary computation is NOT an overlay — it is a trigger that writes a property."
+    },
+
+    "overlay": {
+      "type": "object",
+      "title": "Overlay (affects edge)",
+      "description": "An effect/modifier expressed as an `affects(source → target)` edge. Conditions, materials, equipment bonuses, auras, and spell effects all express as overlays. Effective properties are computed by folding the entity's base property bag with all inbound affects edges in precedence order.",
+      "properties": {
+        "source": { "description": "The entity the effect originates from (the caster, the worn item, an aura node), by id or alias.", "oneOf": [ { "$ref": "#/$defs/id" }, { "$ref": "#/$defs/alias" } ] },
+        "target": { "description": "The entity the effect applies to, by id or alias.", "oneOf": [ { "$ref": "#/$defs/id" }, { "$ref": "#/$defs/alias" } ] },
+        "property": { "type": "string", "description": "The property key the overlay modifies (e.g. \"light\", \"attack_bonus\", \"size\")." },
+        "op": { "$ref": "#/$defs/overlayOp" },
+        "magnitude": { "$ref": "#/$defs/value", "description": "The amount/value of the modification." },
+        "precedence": { "type": "integer", "description": "Fold order relative to other overlays on the same property." },
+        "duration": { "type": ["integer", "null"], "description": "Remaining ticks; null/absent for an indefinite effect. The engine decrements it and emits an expiry event when it elapses." }
+      },
+      "required": ["property", "op"],
+      "additionalProperties": false
+    }
+  },
+
+  "title_note": "Top-level: this schema is referenced by $def. A document conforming to this schema is any one of the canonical object types.",
+  "oneOf": [
+    { "$ref": "#/$defs/entity" },
+    { "$ref": "#/$defs/relationType" },
+    { "$ref": "#/$defs/relation" },
+    { "$ref": "#/$defs/overlay" }
+  ],
+
+  "examples": [
+    {
+      "alias": "crypt", "id": null, "name": "The Bone Crypt", "kind": "room", "parent": "room",
+      "properties": { "light_level": 2, "prose": "A low basilica of bone.", "exits": ["north", "stairs"] },
+      "lifecycle": "active"
+    },
+    {
+      "name": "riding", "directionality": "directed", "cardinality": "various-to-one",
+      "role": "containment", "symmetry": "asymmetric", "exclusion_group": null,
+      "invariants": ["acyclic"], "payload_schema": { "cell": "int3?" }
+    },
+    {
+      "type": "in", "from": "altar", "to": "crypt", "role": "containment",
+      "cardinality": "various-to-one", "exclusion_group": "location",
+      "payload": { "cell": { "x": 4, "y": 0, "z": 0 } }
+    },
+    {
+      "source": "cleric", "target": "tessera", "property": "attack_bonus",
+      "op": "add", "magnitude": 1, "precedence": 100, "duration": 6
+    }
+  ]
+}

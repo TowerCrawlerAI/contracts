@@ -1,0 +1,441 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.tapestry.dev/engine/command-event-protocol.schema.json",
+  "title": "Tapestry Engine Command/Event Protocol (Contract C1)",
+  "description": "Wire contract for the Tapestry engine. The engine reads one JSON command object per line on its input stream and writes one JSON record per line on its output stream. Output records are of two families: replayable player events wrapped in the event envelope, and bare host-control reply records. Consumers MUST distinguish records by the top-level `type` field. This schema is the single source of truth for those shapes; it carries transport/dispatch semantics only and no ruleset (content) semantics. Ruleset payloads ride the generic SIGNAL event channel.",
+
+  "$defs": {
+    "entityId": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "An entity (node) id. Ids are minted by the engine, are monotonic within a single running session, and are never reused within that session. They are NOT stable across sessions or instances."
+    },
+    "actorRef": {
+      "description": "An actor id, or null/absent to address the bootstrap player.",
+      "oneOf": [
+        { "$ref": "#/$defs/entityId" },
+        { "type": "null" }
+      ]
+    },
+    "value": {
+      "description": "A property value in the engine variant system: a scalar (string, boolean, integer, or float), a dice-expression string (e.g. \"2d6+4\"), or a list of values. Object values may appear in structured payloads.",
+      "anyOf": [
+        { "type": "string" },
+        { "type": "boolean" },
+        { "type": "number" },
+        { "type": "null" },
+        { "type": "array" },
+        { "type": "object" }
+      ]
+    },
+
+    "command": {
+      "title": "Command (input stream)",
+      "description": "One command object per line on the input stream, dispatched on `type`. A malformed line, or a missing/unknown `type`, produces a recoverable ERROR event and the session continues.",
+      "oneOf": [
+        { "$ref": "#/$defs/cmd_input" },
+        { "$ref": "#/$defs/cmd_action" },
+        { "$ref": "#/$defs/cmd_query_state" },
+        { "$ref": "#/$defs/cmd_spawn_actor" },
+        { "$ref": "#/$defs/cmd_despawn_actor" },
+        { "$ref": "#/$defs/cmd_move_actor" },
+        { "$ref": "#/$defs/cmd_rotate_actor" },
+        { "$ref": "#/$defs/cmd_snapshot" },
+        { "$ref": "#/$defs/cmd_restore" },
+        { "$ref": "#/$defs/cmd_graph_hash" },
+        { "$ref": "#/$defs/cmd_quit" }
+      ]
+    },
+
+    "cmd_input": {
+      "type": "object",
+      "description": "The text-verb path: a raw command sentence parsed by the engine's verb grammar, which resolves nouns to entity ids and runs the full verb workflow.",
+      "properties": {
+        "type": { "const": "input" },
+        "raw": { "type": "string", "description": "The raw command text, e.g. \"attack throne\"." },
+        "actor": { "$ref": "#/$defs/actorRef", "description": "The acting actor; absent/null/0 addresses the bootstrap player." }
+      },
+      "required": ["type", "raw"],
+      "additionalProperties": false
+    },
+
+    "cmd_action": {
+      "type": "object",
+      "description": "Structured, parser-bypassing command. Enters dispatch at the resolved-id seam: nouns are already entity ids, so no name matching or disambiguation occurs. The full verb workflow then runs exactly as for a parsed text command. Intended for clients that already hold the ids they are acting on (e.g. point-and-click).",
+      "properties": {
+        "type": { "const": "action" },
+        "actor": { "$ref": "#/$defs/entityId", "description": "The acting actor id." },
+        "verb": { "type": "string", "description": "The verb name as registered in the loaded content. An unknown verb produces a recoverable ERROR event." },
+        "nouns": {
+          "type": "array",
+          "description": "Already-resolved entity ids in slot order (first noun, then second noun for two-noun verbs).",
+          "items": { "$ref": "#/$defs/entityId" }
+        },
+        "params": {
+          "type": "object",
+          "description": "Optional structured, verb-specific arguments (e.g. a target cell `{\"cell\":[x,y,z]}`). Empty object for most actions.",
+          "default": {}
+        }
+      },
+      "required": ["type", "actor", "verb", "nouns"],
+      "additionalProperties": false
+    },
+
+    "cmd_query_state": {
+      "type": "object",
+      "description": "Read the live graph as JSON on demand. A pure read: it never mutates state and never advances the tick. With an actor/scope filter the export is limited to that actor's perceivable view; with no filter it returns the full graph. The response is a `state` host-control record (see Contract C2 for the response shape).",
+      "properties": {
+        "type": { "const": "query_state" },
+        "actor": { "$ref": "#/$defs/actorRef", "description": "Filter the export to this actor's perceivable view. Omit for a full (host/admin) export." },
+        "scope": {
+          "type": "string",
+          "enum": ["actor", "room", "graph"],
+          "description": "The breadth of the export."
+        },
+        "root": { "$ref": "#/$defs/entityId", "description": "Optional root entity to scope the export around." }
+      },
+      "required": ["type"],
+      "additionalProperties": false
+    },
+
+    "cmd_spawn_actor": {
+      "type": "object",
+      "description": "Embody a character as an actor node in the running session. Optionally seeds the actor from a portable character blob (Contract C2). Reply: an `actor_spawned` host-control record.",
+      "properties": {
+        "type": { "const": "spawn_actor" },
+        "name": { "type": "string", "description": "Display name for the spawned actor." },
+        "room": { "$ref": "#/$defs/entityId", "description": "Container to spawn into; omit to use the floor's start room." },
+        "state": {
+          "type": "object",
+          "description": "Optional portable character blob in engine-side form `{name, props, items}` (Contract C2 §2.2)."
+        }
+      },
+      "required": ["type", "name"],
+      "additionalProperties": false
+    },
+
+    "cmd_despawn_actor": {
+      "type": "object",
+      "description": "Remove an actor from the running session. Reply: an `actor_despawned` host-control record carrying the serialized portable blob (Contract C2).",
+      "properties": {
+        "type": { "const": "despawn_actor" },
+        "actor": { "$ref": "#/$defs/entityId" }
+      },
+      "required": ["type", "actor"],
+      "additionalProperties": false
+    },
+
+    "cmd_move_actor": {
+      "type": "object",
+      "description": "Host-control intra-container move of an actor to a cell. Occupancy-validated. Success emits a location STATE_CHANGE event; a refusal emits a `move_refused` host-control record.",
+      "properties": {
+        "type": { "const": "move_actor" },
+        "actor": { "$ref": "#/$defs/entityId" },
+        "x": { "type": "integer" },
+        "y": { "type": "integer" },
+        "z": { "type": "integer" }
+      },
+      "required": ["type", "actor", "x", "y", "z"],
+      "additionalProperties": false
+    },
+
+    "cmd_rotate_actor": {
+      "type": "object",
+      "description": "Set an actor's facing in degrees. Success emits a `facing` STATE_CHANGE event; an out-of-range value emits a `rotate_refused` host-control record.",
+      "properties": {
+        "type": { "const": "rotate_actor" },
+        "actor": { "$ref": "#/$defs/entityId" },
+        "facing": { "type": "integer", "minimum": 0, "maximum": 359, "description": "Facing in degrees, 0-359." }
+      },
+      "required": ["type", "actor", "facing"],
+      "additionalProperties": false
+    },
+
+    "cmd_snapshot": {
+      "type": "object",
+      "description": "Request a whole-graph checkpoint of the running session. The checkpoint is an opaque, deterministic binary blob the host stores; it is not part of the event stream. Reply: a host-control record referencing the produced checkpoint.",
+      "properties": {
+        "type": { "const": "snapshot" }
+      },
+      "required": ["type"],
+      "additionalProperties": false
+    },
+
+    "cmd_restore": {
+      "type": "object",
+      "description": "Rebuild the session graph from a previously produced checkpoint blob.",
+      "properties": {
+        "type": { "const": "restore" },
+        "blob": { "type": "string", "description": "An opaque checkpoint blob previously produced by `snapshot`, encoded as the host stored it." }
+      },
+      "required": ["type"],
+      "additionalProperties": false
+    },
+
+    "cmd_graph_hash": {
+      "type": "object",
+      "description": "Request a deterministic hash of the current graph state, for replay/determinism verification. Reply: a `graph_hash` host-control record.",
+      "properties": {
+        "type": { "const": "graph_hash" }
+      },
+      "required": ["type"],
+      "additionalProperties": false
+    },
+
+    "cmd_quit": {
+      "type": "object",
+      "description": "Clean shutdown of the session. End-of-input also exits.",
+      "properties": {
+        "type": { "const": "quit" }
+      },
+      "required": ["type"],
+      "additionalProperties": false
+    },
+
+    "outputRecord": {
+      "title": "Output record (output stream)",
+      "description": "One record per line on the output stream. Either a player event envelope (`type` = \"event\") or a bare host-control reply record.",
+      "oneOf": [
+        { "$ref": "#/$defs/eventEnvelope" },
+        { "$ref": "#/$defs/reply_actor_spawned" },
+        { "$ref": "#/$defs/reply_actor_despawned" },
+        { "$ref": "#/$defs/reply_move_refused" },
+        { "$ref": "#/$defs/reply_rotate_refused" },
+        { "$ref": "#/$defs/reply_state" },
+        { "$ref": "#/$defs/reply_snapshot" },
+        { "$ref": "#/$defs/reply_graph_hash" }
+      ]
+    },
+
+    "eventEnvelope": {
+      "type": "object",
+      "title": "Player event envelope",
+      "description": "The replayable event stream. Every player event shares this envelope. `event_type` is the numeric kind; `event_name` is its symbolic name (or a caller-supplied name for SIGNAL); `data` is the per-kind payload.",
+      "properties": {
+        "type": { "const": "event" },
+        "tick": { "type": "integer", "minimum": 0, "description": "The logical tick at which the event was emitted." },
+        "event_type": {
+          "type": "integer",
+          "enum": [0, 1, 2, 3, 4, 5, 6, 7],
+          "description": "0 INPUT, 1 OUTPUT, 2 STATE_CHANGE, 3 DICE_ROLL, 4 FIRED, 5 TICK_ADVANCED, 6 ERROR, 7 SIGNAL."
+        },
+        "event_name": {
+          "type": "string",
+          "description": "Symbolic event name. For event_type 7 (SIGNAL) this is a caller-supplied content channel name (e.g. \"TURN_REQUEST\", \"INVENTORY\")."
+        },
+        "data": { "type": "object", "description": "Per-event_type payload; see the data $defs below." }
+      },
+      "required": ["type", "tick", "event_type", "event_name", "data"],
+      "additionalProperties": false,
+      "allOf": [
+        { "if": { "properties": { "event_type": { "const": 0 } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_input" } } } },
+        { "if": { "properties": { "event_type": { "const": 1 } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_output" } } } },
+        { "if": { "properties": { "event_type": { "const": 2 } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_state_change" } } } },
+        { "if": { "properties": { "event_type": { "const": 3 } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_dice_roll" } } } },
+        { "if": { "properties": { "event_type": { "const": 4 } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_fired" } } } },
+        { "if": { "properties": { "event_type": { "const": 5 } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_tick_advanced" } } } },
+        { "if": { "properties": { "event_type": { "const": 6 } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_error" } } } },
+        { "if": { "properties": { "event_type": { "const": 7 } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_signal" } } } }
+      ]
+    },
+
+    "data_input": {
+      "type": "object",
+      "description": "INPUT (event_type 0): the command as received.",
+      "properties": {
+        "raw": { "type": "string" },
+        "cleaned": { "type": ["string", "null"], "description": "Normalized form of `raw`, or null." },
+        "actor": { "$ref": "#/$defs/entityId" }
+      },
+      "required": ["raw", "actor"]
+    },
+
+    "data_output": {
+      "type": "object",
+      "description": "OUTPUT (event_type 1): narrative text directed to an audience. The `audience` is the engine-computed observer set; visibility is filtered server-side.",
+      "properties": {
+        "text": { "type": "string" },
+        "verb": { "type": ["string", "null"] },
+        "actor": { "$ref": "#/$defs/entityId" },
+        "audience": { "type": "array", "items": { "$ref": "#/$defs/entityId" }, "description": "Computed set of observer ids." },
+        "exits": { "type": "array", "items": { "type": "string" }, "description": "Available exits, when relevant." }
+      },
+      "required": ["text", "actor"]
+    },
+
+    "data_state_change": {
+      "type": "object",
+      "description": "STATE_CHANGE (event_type 2): an incremental graph mutation. Covers location-group relation moves and scalar property writes; carries before/after and, for location moves, cell coordinates and a first-seen flag.",
+      "properties": {
+        "entity": { "$ref": "#/$defs/entityId" },
+        "key": { "type": "string", "description": "The changed property key, or a relation marker such as \"rel:in\"." },
+        "before": { "$ref": "#/$defs/value" },
+        "after": { "$ref": "#/$defs/value" },
+        "x": { "type": "integer" },
+        "y": { "type": "integer" },
+        "z": { "type": "integer" },
+        "first_seen": { "type": "boolean" }
+      },
+      "required": ["entity", "key"]
+    },
+
+    "data_dice_roll": {
+      "type": "object",
+      "description": "DICE_ROLL (event_type 3): a deterministic, seeded dice evaluation.",
+      "properties": {
+        "expr": { "type": "string", "description": "The dice expression, e.g. \"2d6+4\"." },
+        "result": { "type": "integer" },
+        "roller": { "$ref": "#/$defs/entityId" }
+      },
+      "required": ["expr", "result", "roller"]
+    },
+
+    "data_fired": {
+      "type": "object",
+      "description": "FIRED (event_type 4): an internal event was fired at a target.",
+      "properties": {
+        "name": { "type": "string" },
+        "target": { "$ref": "#/$defs/entityId" },
+        "payload": { "$ref": "#/$defs/value" }
+      },
+      "required": ["name", "target"]
+    },
+
+    "data_tick_advanced": {
+      "type": "object",
+      "description": "TICK_ADVANCED (event_type 5): the logical clock advanced. Empty payload.",
+      "additionalProperties": false
+    },
+
+    "data_error": {
+      "type": "object",
+      "description": "ERROR (event_type 6): a recoverable error; the session continues. (Fatal errors are reported separately on the error stream.)",
+      "properties": {
+        "level": { "type": "string", "description": "Severity, e.g. \"warn\"." },
+        "message": { "type": "string" },
+        "traceback": { "type": ["string", "null"] }
+      },
+      "required": ["level", "message"]
+    },
+
+    "data_signal": {
+      "type": "object",
+      "description": "SIGNAL (event_type 7): the ruleset-agnostic content channel. `event_name` (on the envelope) is the caller-supplied channel name; this `data` is the verbatim content payload and is opaque to the transport contract.",
+      "additionalProperties": true
+    },
+
+    "reply_actor_spawned": {
+      "type": "object",
+      "description": "Host-control reply to `spawn_actor`.",
+      "properties": {
+        "type": { "const": "actor_spawned" },
+        "actor": { "$ref": "#/$defs/entityId" },
+        "room": { "$ref": "#/$defs/entityId" }
+      },
+      "required": ["type", "actor", "room"],
+      "additionalProperties": false
+    },
+
+    "reply_actor_despawned": {
+      "type": "object",
+      "description": "Host-control reply to `despawn_actor`, carrying the serialized portable blob (Contract C2). Note: an empty item set may serialize as `{}` rather than `[]`; consumers should coerce.",
+      "properties": {
+        "type": { "const": "actor_despawned" },
+        "actor": { "$ref": "#/$defs/entityId" },
+        "state": { "description": "The engine-side portable blob `{name, props, items}` (Contract C2), or `{}` if none." }
+      },
+      "required": ["type", "actor", "state"],
+      "additionalProperties": false
+    },
+
+    "reply_move_refused": {
+      "type": "object",
+      "description": "Host-control reply when a `move_actor` is rejected.",
+      "properties": {
+        "type": { "const": "move_refused" },
+        "actor": { "$ref": "#/$defs/entityId" },
+        "x": { "type": "integer" },
+        "y": { "type": "integer" },
+        "z": { "type": "integer" },
+        "reason": { "type": "string", "description": "e.g. \"blocked\"." }
+      },
+      "required": ["type", "actor", "reason"],
+      "additionalProperties": false
+    },
+
+    "reply_rotate_refused": {
+      "type": "object",
+      "description": "Host-control reply when a `rotate_actor` is rejected.",
+      "properties": {
+        "type": { "const": "rotate_refused" },
+        "actor": { "$ref": "#/$defs/entityId" },
+        "facing": { "type": "integer" },
+        "reason": { "type": "string", "description": "e.g. \"out_of_range\"." }
+      },
+      "required": ["type", "actor", "reason"],
+      "additionalProperties": false
+    },
+
+    "reply_state": {
+      "type": "object",
+      "description": "Host-control reply to `query_state`. A pure read: it carries the current tick and a graph/actor projection. The detailed projection shape is owned by Contract C2 (state/portable-state.schema.json).",
+      "properties": {
+        "type": { "const": "state" },
+        "tick": { "type": "integer", "minimum": 0 },
+        "scope": { "type": "string", "enum": ["actor", "room", "graph"] },
+        "data": {
+          "type": "object",
+          "description": "A graph projection: `{nodes:[...], edges:[...]}` for graph/room scope.",
+          "properties": {
+            "nodes": { "type": "array", "items": { "type": "object" } },
+            "edges": { "type": "array", "items": { "type": "object" } }
+          }
+        },
+        "node": {
+          "type": "object",
+          "description": "A single-actor projection (for scope=actor). See Contract C2 §7 for the full shape."
+        }
+      },
+      "required": ["type", "tick"],
+      "additionalProperties": true
+    },
+
+    "reply_snapshot": {
+      "type": "object",
+      "description": "Host-control reply to `snapshot`, referencing the produced checkpoint blob.",
+      "properties": {
+        "type": { "const": "snapshot" },
+        "blob": { "type": "string", "description": "An opaque, deterministic checkpoint blob for the host to store." }
+      },
+      "required": ["type"],
+      "additionalProperties": true
+    },
+
+    "reply_graph_hash": {
+      "type": "object",
+      "description": "Host-control reply to `graph_hash`.",
+      "properties": {
+        "type": { "const": "graph_hash" },
+        "hash": { "type": "string", "description": "A deterministic hash of the current graph state." }
+      },
+      "required": ["type", "hash"],
+      "additionalProperties": false
+    }
+  },
+
+  "oneOf": [
+    { "$ref": "#/$defs/command" },
+    { "$ref": "#/$defs/outputRecord" }
+  ],
+
+  "examples": [
+    { "type": "input", "raw": "attack throne", "actor": 42 },
+    { "type": "action", "actor": 42, "verb": "attack", "nouns": [51, 7], "params": {} },
+    { "type": "query_state", "scope": "actor", "actor": 42 },
+    { "type": "event", "tick": 12, "event_type": 1, "event_name": "OUTPUT", "data": { "text": "The skeleton clatters and strikes back.", "verb": "attack", "actor": 42, "audience": [42, 7] } },
+    { "type": "event", "tick": 12, "event_type": 2, "event_name": "STATE_CHANGE", "data": { "entity": 7, "key": "hp", "before": 9, "after": 4 } },
+    { "type": "event", "tick": 12, "event_type": 3, "event_name": "DICE_ROLL", "data": { "expr": "2d6+4", "result": 11, "roller": 42 } },
+    { "type": "actor_spawned", "actor": 42, "room": 104 },
+    { "type": "actor_despawned", "actor": 42, "state": { "name": "Tessera", "props": { "hp": 6, "max_hp": 30, "ac": 16, "level": 5 }, "items": [] } }
+  ]
+}

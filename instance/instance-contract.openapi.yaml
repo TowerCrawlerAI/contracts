@@ -1,0 +1,231 @@
+openapi: 3.1.0
+info:
+  title: Tapestry Instance Contract (C3)
+  version: "1.0.0"
+  summary: Plane-2 instance lifecycle + routing.
+  description: >
+    Contract C3 — the HTTP contract for the instance tier. Two sides of one seam:
+
+    1. **Instance-process contract** — the endpoints a managed instance process (one host wrapping one
+       engine) MUST expose so the orchestrator can health-check and drain it.
+
+    2. **Gateway contract** — the endpoints clients and the control plane call on the orchestrator to
+       be routed to (and connected through to) an instance.
+
+    A client never calls the instance-process endpoints directly; it goes through the gateway. The
+    portable character blob that crosses the instance boundary on join/leave/portal is Contract C2;
+    the wire each instance speaks once connected is Contract C1.
+
+servers:
+  - url: http://localhost:8080
+    description: Gateway (orchestrator) — default bind.
+
+tags:
+  - name: instance-process
+    description: Endpoints a managed instance process must expose.
+  - name: gateway
+    description: Endpoints the orchestrator exposes to clients / control plane.
+
+paths:
+  /healthz:
+    get:
+      tags: [gateway, instance-process]
+      operationId: healthz
+      summary: Liveness probe.
+      description: >
+        Returns 200 once the process is up and accepting connections. Exposed by BOTH the gateway
+        (its own liveness) and every managed instance process (polled after spawn until ready).
+      responses:
+        "200":
+          description: Up.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+              example: { status: ok }
+
+  /instance/status:
+    get:
+      tags: [instance-process]
+      operationId: instanceStatus
+      summary: Instance readiness + population.
+      description: >
+        Exposed by a managed instance process. `population` (number of connected players) drives
+        drain/reap decisions; `ready` signals the instance has finished its own warm-up.
+      responses:
+        "200":
+          description: Status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstanceStatus"
+              example: { ready: true, population: 3 }
+
+  /ready:
+    get:
+      tags: [gateway]
+      operationId: gatewayReady
+      summary: Gateway readiness probe.
+      description: Readiness is gated on a running hub; returns `degraded` until the hub is available.
+      responses:
+        "200":
+          description: Ready.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+              example: { status: ready, tavern: "main" }
+        "503":
+          description: Degraded.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+              example: { status: degraded, tavern: null }
+
+  /route:
+    post:
+      tags: [gateway]
+      operationId: route
+      summary: Resolve or spawn an instance and return where to connect.
+      description: >
+        Authenticates the caller, resolves an existing instance or spawns a new one, and returns the
+        connection target. Routing keys on `(floor, party)`: a dungeon floor gets a private instance
+        per party; the hub floor is shared. The response `account` is the VERIFIED account, not the
+        client-asserted hint. Clients may then connect to the returned `ws_base` directly, or use the
+        proxy at `/ws/route`.
+      security:
+        - bearerAuth: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RouteRequest" }
+            example: { account: "acct-hint", party: "party-7", floor: "bone_garden" }
+      responses:
+        "200":
+          description: Routed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RouteResponse" }
+              example:
+                instance_id: "0f9c2e1a-7b3d-4c5e-9a01-2b3c4d5e6f70"
+                account: "verified-uid"
+                endpoint: "http://127.0.0.1:9001"
+                ws_base: "ws://127.0.0.1:9001"
+                floor: "bone_garden"
+        "401":
+          description: Unauthenticated.
+        "503":
+          description: No instance could be spawned.
+
+  /instances:
+    get:
+      tags: [gateway]
+      operationId: listInstances
+      summary: Snapshot list of known instances.
+      responses:
+        "200":
+          description: Instance records.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/InstanceRecord" }
+
+  /ws/route:
+    get:
+      tags: [gateway]
+      operationId: wsRoute
+      summary: WebSocket proxy — single stable connection URL.
+      description: >
+        WebSocket upgrade endpoint (documented here because OpenAPI 3.1 has no native WebSocket type).
+        The gateway accepts the client socket, resolves/spawns the instance, dials the instance's
+        socket, and proxies frames both ways until either side closes. Authenticated via the `token`
+        query parameter (or an Authorization header) on the upgrade. Clean close codes: `4503`
+        spawn/route failure, `4504` instance socket unreachable, `1008` auth/precondition failure.
+      parameters:
+        - { name: floor, in: query, required: true, schema: { type: string }, description: Floor id to enter. }
+        - { name: party, in: query, required: true, schema: { type: string }, description: Party id. }
+        - { name: session, in: query, required: false, schema: { type: string }, description: Optional session id. }
+        - { name: account, in: query, required: false, schema: { type: string }, description: Account hint (honoured only when auth is disabled). }
+        - { name: token, in: query, required: false, schema: { type: string }, description: Auth token for the upgrade. }
+      responses:
+        "101":
+          description: Switching protocols — WebSocket established and proxied.
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >
+        Bearer token. In token mode, a shared secret; in identity mode, a verified identity token whose
+        subject becomes the account. With authentication disabled (dev/CI) the endpoint is open and the
+        client-asserted account hint is honoured.
+
+  schemas:
+    Health:
+      type: object
+      properties:
+        status: { type: string, enum: [ok] }
+      required: [status]
+
+    InstanceStatus:
+      type: object
+      description: An instance process's self-report.
+      properties:
+        ready: { type: boolean, description: The instance finished its warm-up. }
+        population: { type: integer, minimum: 0, description: Number of connected players. }
+      required: [ready, population]
+
+    Readiness:
+      type: object
+      properties:
+        status: { type: string, enum: [ready, degraded] }
+        tavern:
+          type: [string, "null"]
+          description: The hub instance id, or null if none is running.
+      required: [status]
+
+    RouteRequest:
+      type: object
+      properties:
+        account:
+          type: [string, "null"]
+          description: Client-asserted account hint. Honoured only when auth is disabled; otherwise ignored in favour of the verified token.
+        party:
+          type: string
+          description: Party identifier. A dungeon floor gets a private instance per party.
+        floor:
+          type: string
+          description: Floor id to enter (e.g. "bone_garden" or the hub floor).
+      required: [party, floor]
+
+    RouteResponse:
+      type: object
+      properties:
+        instance_id: { type: string, description: Id of the (possibly freshly spawned) instance. }
+        account: { type: string, description: Resolved account, from the verified token (not client-asserted). }
+        endpoint: { type: string, format: uri, description: HTTP base URL for the instance. }
+        ws_base: { type: string, description: WebSocket base URL for the instance. }
+        floor: { type: string, description: Floor id, echoed for confirmation. }
+      required: [instance_id, account, endpoint, ws_base, floor]
+
+    InstanceRecord:
+      type: object
+      description: A registry entry describing one instance.
+      properties:
+        instance_id: { type: string }
+        floor: { type: string }
+        party_id: { type: [string, "null"] }
+        host: { type: string }
+        port: { type: integer }
+        state:
+          type: string
+          enum: [requested, starting, running, draining, stopped]
+        kind:
+          type: string
+          enum: [tavern, dungeon]
+        created_at: { type: string, format: date-time }
+        last_active: { type: string, format: date-time }
+      required: [instance_id, floor, host, port, state, kind, created_at, last_active]
